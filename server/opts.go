@@ -571,6 +571,9 @@ type TLSConfigOpts struct {
 	Ciphers           []uint16
 	CurvePreferences  []tls.CurveID
 	PinnedCerts       PinnedCertSet
+	CertStore         CertStoreType
+	CertMatchBy       CertMatchByType
+	CertMatch         string
 }
 
 // OCSPConfig represents the options of OCSP stapling options.
@@ -603,6 +606,10 @@ e.g.
             "CurveP384",
             "CurveP521"
         ]
+
+        cert_store:     "WindowsCurrentUser"
+        cert_match_by:  "Subject"
+        cert_match:     "MyServer123"
     }
 
 Available cipher suites include:
@@ -3835,6 +3842,26 @@ func parseCipher(cipherName string) (uint16, error) {
 	return cipher, nil
 }
 
+func parseCertStore(certStore string) (CertStoreType, error) {
+	certStoreType, exists := CertStoreMap[strings.ToLower(certStore)]
+	if !exists {
+		return 0, fmt.Errorf("unrecognized cert store type %s", certStore)
+	}
+	validOS, exists := CertStoreOSMap[certStoreType]
+	if !exists || validOS != runtime.GOOS {
+		return 0, fmt.Errorf("cert store type %s requires %s", certStore, validOS)
+	}
+	return certStoreType, nil
+}
+
+func parseCertMatchBy(certMatchBy string) (CertMatchByType, error) {
+	certMatchByType, exists := CertMatchByMap[strings.ToLower(certMatchBy)]
+	if !exists {
+		return 0, fmt.Errorf("unrecognized cert match by type %s", certMatchBy)
+	}
+	return certMatchByType, nil
+}
+
 func parseCurvePreferences(curveName string) (tls.CurveID, error) {
 	curve, exists := curvePreferenceMap[curveName]
 	if !exists {
@@ -3980,6 +4007,32 @@ func parseTLS(v interface{}, isClientCtx bool) (t *TLSConfigOpts, retErr error) 
 				}
 				tc.PinnedCerts = wl
 			}
+		case "cert_store":
+			certStore, ok := mv.(string)
+			if !ok || certStore == "" {
+				return nil, &configErr{tk, "expected 'cert_store' to be a valid non-empty string"}
+			}
+			certStoreType, err := parseCertStore(certStore)
+			if err != nil {
+				return nil, &configErr{tk, err.Error()}
+			}
+			tc.CertStore = certStoreType
+		case "cert_match_by":
+			certMatchBy, ok := mv.(string)
+			if !ok || certMatchBy == "" {
+				return nil, &configErr{tk, "expected 'cert_match_by' to be a valid non-empty string"}
+			}
+			certMatchByType, err := parseCertMatchBy(certMatchBy)
+			if err != nil {
+				return nil, &configErr{tk, err.Error()}
+			}
+			tc.CertMatchBy = certMatchByType
+		case "cert_match":
+			certMatch, ok := mv.(string)
+			if !ok || certMatch == "" {
+				return nil, &configErr{tk, "expected 'cert_match' to be a valid non-empty string"}
+			}
+			tc.CertMatch = certMatch
 		default:
 			return nil, &configErr{tk, fmt.Sprintf("error parsing tls config, unknown field [%q]", mk)}
 		}
@@ -4259,6 +4312,8 @@ func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
 	}
 
 	switch {
+	case tc.CertFile != "" && tc.CertStore != 0:
+		return nil, fmt.Errorf("'cert_file' and 'cert_store' may not both be configured")
 	case tc.CertFile != "" && tc.KeyFile == "":
 		return nil, fmt.Errorf("missing 'key_file' in TLS configuration")
 	case tc.CertFile == "" && tc.KeyFile != "":
@@ -4274,6 +4329,11 @@ func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
 			return nil, fmt.Errorf("error parsing certificate: %v", err)
 		}
 		config.Certificates = []tls.Certificate{cert}
+	case tc.CertStore != _CERTSTOREEMPTY_:
+		err := CertStoreTLSConfig(tc, &config)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Require client certificates as needed
