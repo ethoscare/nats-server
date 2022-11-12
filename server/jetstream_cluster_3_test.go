@@ -1315,3 +1315,40 @@ func TestJetStreamClusterHAssetsEnforcement(t *testing.T) {
 	})
 	require_Error(t, err, exceededErrs...)
 }
+
+func TestJetStreamClusterInterestStreamConsumerReplicas(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.InterestPolicy,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	// Make sure we can not override the consumer replicas.
+	// Interest policy means that the consumers need to match that policy for now.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:  "dlc",
+		Replicas: 1,
+	})
+	require_Error(t, err, NewJSConsumerReplicasShouldMatchStreamError())
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:  "dlc",
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.UpdateConsumer("TEST", &nats.ConsumerConfig{
+		Durable:  "dlc",
+		Replicas: 1,
+	})
+	require_Error(t, err, NewJSConsumerReplicasShouldMatchStreamError())
+
+}

@@ -379,6 +379,10 @@ func checkConsumerCfg(
 	if config.Replicas < 0 {
 		return NewJSReplicasCountCannotBeNegativeError()
 	}
+	// Check if our stream is interest based or workqueue that consumer replicas matches.
+	if cfg.Retention != LimitsPolicy && config.Replicas != 0 && config.Replicas != cfg.Replicas {
+		return NewJSConsumerReplicasShouldMatchStreamError()
+	}
 
 	// Check if we have a BackOff defined that MaxDeliver is within range etc.
 	if lbo := len(config.BackOff); lbo > 0 && config.MaxDeliver <= lbo {
