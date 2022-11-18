@@ -2358,13 +2358,13 @@ func TestJetStreamWorkQueueRetentionStream(t *testing.T) {
 		{name: "MemoryStore", mconfig: &StreamConfig{
 			Name:      "MWQ",
 			Storage:   MemoryStorage,
-			Subjects:  []string{"MY_WORK_QUEUE.*"},
+			Subjects:  []string{"MY_WORK_QUEUE.>"},
 			Retention: WorkQueuePolicy},
 		},
 		{name: "FileStore", mconfig: &StreamConfig{
 			Name:      "MWQ",
 			Storage:   FileStorage,
-			Subjects:  []string{"MY_WORK_QUEUE.*"},
+			Subjects:  []string{"MY_WORK_QUEUE.>"},
 			Retention: WorkQueuePolicy},
 		},
 	}
@@ -2430,7 +2430,7 @@ func TestJetStreamWorkQueueRetentionStream(t *testing.T) {
 			if _, err := mset.addConsumer(pConfig("MY_WORK_QUEUE.A")); err == nil {
 				t.Fatalf("Expected an error on attempt for partitioned consumer for a workqueue")
 			}
-			if _, err := mset.addConsumer(pConfig("MY_WORK_QUEUE.A")); err == nil {
+			if _, err := mset.addConsumer(pConfig("MY_WORK_QUEUE.B")); err == nil {
 				t.Fatalf("Expected an error on attempt for partitioned consumer for a workqueue")
 			}
 
@@ -2442,6 +2442,22 @@ func TestJetStreamWorkQueueRetentionStream(t *testing.T) {
 			o.delete()
 			o2.delete()
 			o3.delete()
+
+			// Test with wildcards, first from wider to narrower
+			o, err = mset.addConsumer(pConfig("MY_WORK_QUEUE.>"))
+			require_NoError(t, err)
+			if _, err := mset.addConsumer(pConfig("MY_WORK_QUEUE.*.BAR")); err == nil {
+				t.Fatalf("Expected an error on attempt for partitioned consumer for a workqueue")
+			}
+			o.delete()
+
+			// Now from narrower to wider
+			o, err = mset.addConsumer(pConfig("MY_WORK_QUEUE.*.BAR"))
+			require_NoError(t, err)
+			if _, err := mset.addConsumer(pConfig("MY_WORK_QUEUE.>")); err == nil {
+				t.Fatalf("Expected an error on attempt for partitioned consumer for a workqueue")
+			}
+			o.delete()
 
 			// Push based will be allowed now, including ephemerals.
 			// They can not overlap etc meaning same rules as above apply.
@@ -14634,7 +14650,8 @@ func TestJetStreamPullConsumerCrossAccountExpires(t *testing.T) {
 		return nil
 	})
 	// Now make sure the ephemeral goes away too.
-	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+	// Ephemerals have jitter by default of up to 1s.
+	checkFor(t, 6*time.Second, 10*time.Millisecond, func() error {
 		_, err := js.ConsumerInfo("PC", ci.Name)
 		if err == nil {
 			return fmt.Errorf("Consumer still present")
@@ -14924,7 +14941,7 @@ func TestJetStreamPullConsumersOneShotBehavior(t *testing.T) {
 	}
 
 	noMsgs := &nats.Header{"Status": []string{"404"}, "Description": []string{"No Messages"}}
-	reqTimeout := &nats.Header{"Status": []string{"408"}, "Description": []string{"Request Timeout"}}
+	reqTimeout := &nats.Header{"Status": []string{"408"}, "Description": []string{"Request Timeout"}, "Nats-Pending-Bytes": []string{"0"}, "Nats-Pending-Messages": []string{"1"}}
 
 	// We are empty here, meaning no messages available.
 	// Do not wait, should get noMsgs.
@@ -15628,7 +15645,6 @@ func TestJetStreamPullConsumerHeartBeats(t *testing.T) {
 	// If HB larger than 50% of expires..
 	expectErr(doReq(1, 75*time.Millisecond, 100*time.Millisecond, 1))
 
-	reqTimeout := nats.Header{"Status": []string{"408"}, "Description": []string{"Request Timeout"}}
 	expectHBs := func(start time.Time, msgs []*tsMsg, expected int, hbi time.Duration) {
 		t.Helper()
 		if len(msgs) != expected {
@@ -15650,8 +15666,8 @@ func TestJetStreamPullConsumerHeartBeats(t *testing.T) {
 		}
 		// Last msg should be timeout.
 		lm := msgs[len(msgs)-1].msg
-		if !reflect.DeepEqual(lm.Header, reqTimeout) {
-			t.Fatalf("Expected %+v hdr, got %+v", reqTimeout, lm.Header)
+		if key := lm.Header.Get("Status"); key != "408" {
+			t.Fatalf("Expected 408 Request Timeout, got %s", key)
 		}
 	}
 
@@ -15676,8 +15692,8 @@ func TestJetStreamPullConsumerHeartBeats(t *testing.T) {
 	}
 	// Last should be timeout.
 	lm := msgs[len(msgs)-1].msg
-	if !reflect.DeepEqual(lm.Header, reqTimeout) {
-		t.Fatalf("Expected %+v hdr, got %+v", reqTimeout, lm.Header)
+	if key := lm.Header.Get("Status"); key != "408" {
+		t.Fatalf("Expected 408 Request Timeout, got %s", key)
 	}
 }
 
@@ -16868,11 +16884,19 @@ func TestJetStreamConsumerStreamUpdate(t *testing.T) {
 		_, err = js.AddStream(&nats.StreamConfig{Name: "foo", Duplicates: 1 * time.Minute, Replicas: replica})
 		defer js.DeleteStream("foo")
 		require_NoError(t, err)
+		// Update with no change
 		_, err = js.UpdateStream(&nats.StreamConfig{Name: "foo", Duplicates: 1 * time.Minute, Replicas: replica})
+		require_NoError(t, err)
+		// Update with change
+		_, err = js.UpdateStream(&nats.StreamConfig{Description: "stream", Name: "foo", Duplicates: 1 * time.Minute, Replicas: replica})
 		require_NoError(t, err)
 		_, err = js.AddConsumer("foo", &nats.ConsumerConfig{Durable: "dur1", AckPolicy: nats.AckExplicitPolicy})
 		require_NoError(t, err)
+		// Update with no change
 		_, err = js.UpdateConsumer("foo", &nats.ConsumerConfig{Durable: "dur1", AckPolicy: nats.AckExplicitPolicy})
+		require_NoError(t, err)
+		// Update with change
+		_, err = js.UpdateConsumer("foo", &nats.ConsumerConfig{Description: "consumer", Durable: "dur1", AckPolicy: nats.AckExplicitPolicy})
 		require_NoError(t, err)
 	}
 	t.Run("clustered", func(t *testing.T) {
@@ -17400,8 +17424,10 @@ func TestJetStreamPullMaxBytes(t *testing.T) {
 		if len(m.Data) != 0 {
 			t.Fatalf("Did not expect data, got %d bytes", len(m.Data))
 		}
-		if !reflect.DeepEqual(&m.Header, expected) {
-			t.Fatalf("Expected %+v hdr, got %+v", expected, m.Header)
+		expectedStatus, givenStatus := expected.Get("Status"), m.Header.Get("Status")
+		expectedDesc, givenDesc := expected.Get("Description"), m.Header.Get("Description")
+		if expectedStatus != givenStatus || expectedDesc != givenDesc {
+			t.Fatalf("expected  %s %s, got %s %s", expectedStatus, expectedDesc, givenStatus, givenDesc)
 		}
 	}
 
@@ -18099,79 +18125,6 @@ func TestJetStreamDirectMsgGetNext(t *testing.T) {
 	m = getMsg(14, "baz")
 	require_True(t, m.Header.Get(JSSequence) == "14")
 	require_True(t, m.Header.Get(JSSubject) == "baz")
-}
-
-func TestJetStreamConsumerInactiveThreshold(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
-	defer s.Shutdown()
-
-	nc, js := jsClientConnect(t, s)
-	defer nc.Close()
-
-	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
-	require_NoError(t, err)
-
-	for i := 0; i < 10; i++ {
-		js.PublishAsync("foo", []byte("ok"))
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Did not receive completion signal")
-	}
-
-	waitOnCleanup := func(ci *nats.ConsumerInfo) {
-		t.Helper()
-		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
-			_, err := js.ConsumerInfo(ci.Stream, ci.Name)
-			if err == nil {
-				return fmt.Errorf("Consumer still present")
-			}
-			return nil
-		})
-	}
-
-	// Test to make sure inactive threshold is enforced for all types.
-	// Ephemeral and Durable, both push and pull.
-
-	// Ephemeral Push (no bind to deliver subject)
-	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
-		DeliverSubject:    "_no_bind_",
-		InactiveThreshold: 50 * time.Millisecond,
-	})
-	require_NoError(t, err)
-	waitOnCleanup(ci)
-
-	// Ephemeral Pull
-	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
-		AckPolicy:         nats.AckExplicitPolicy,
-		InactiveThreshold: 50 * time.Millisecond,
-	})
-	require_NoError(t, err)
-	waitOnCleanup(ci)
-
-	// Support InactiveThresholds for Durables as well.
-
-	// Durable Push (no bind to deliver subject)
-	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
-		Durable:           "d1",
-		DeliverSubject:    "_no_bind_",
-		InactiveThreshold: 50 * time.Millisecond,
-	})
-	require_NoError(t, err)
-	waitOnCleanup(ci)
-
-	// Durable Pull
-	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
-		Durable:           "d2",
-		AckPolicy:         nats.AckExplicitPolicy,
-		InactiveThreshold: 50 * time.Millisecond,
-	})
-	require_NoError(t, err)
-	waitOnCleanup(ci)
 }
 
 func TestJetStreamConsumerAndStreamNamesWithPathSeparators(t *testing.T) {
@@ -19643,4 +19596,234 @@ func TestJetStreamPullConsumerLastPerSubjectRedeliveries(t *testing.T) {
 		}
 		m.Ack()
 	}
+}
+
+func TestJetStreamPullConsumersTimeoutHeaders(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo.>"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "dlc",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	nc.Publish("foo.foo", []byte("foo"))
+	nc.Publish("foo.bar", []byte("bar"))
+	nc.Publish("foo.else", []byte("baz"))
+	nc.Flush()
+
+	// We will do low level requests by hand for this test as to not depend on any client impl.
+	rsubj := fmt.Sprintf(JSApiRequestNextT, "TEST", "dlc")
+
+	maxBytes := 1024
+	batch := 50
+	req := &JSApiConsumerGetNextRequest{Batch: batch, Expires: 100 * time.Millisecond, NoWait: false, MaxBytes: maxBytes}
+	jreq, err := json.Marshal(req)
+	require_NoError(t, err)
+	// Create listener.
+	reply, msgs := nats.NewInbox(), make(chan *nats.Msg, batch)
+	sub, err := nc.ChanSubscribe(reply, msgs)
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+
+	// Send request.
+	err = nc.PublishRequest(rsubj, reply, jreq)
+	require_NoError(t, err)
+
+	bytesReceived := 0
+	messagesReceived := 0
+
+	checkHeaders := func(expectedStatus, expectedDesc string, m *nats.Msg) {
+		t.Helper()
+		if value := m.Header.Get("Status"); value != expectedStatus {
+			t.Fatalf("Expected status %q, got %q", expectedStatus, value)
+		}
+		if value := m.Header.Get("Description"); value != expectedDesc {
+			t.Fatalf("Expected description %q, got %q", expectedDesc, value)
+		}
+		if value := m.Header.Get(JSPullRequestPendingMsgs); value != fmt.Sprint(batch-messagesReceived) {
+			t.Fatalf("Expected %d messages, got %s", batch-messagesReceived, value)
+		}
+		if value := m.Header.Get(JSPullRequestPendingBytes); value != fmt.Sprint(maxBytes-bytesReceived) {
+			t.Fatalf("Expected %d bytes, got %s", maxBytes-bytesReceived, value)
+		}
+	}
+
+	for done := false; !done; {
+		select {
+		case m := <-msgs:
+			if len(m.Data) == 0 && m.Header != nil {
+				checkHeaders("408", "Request Timeout", m)
+				done = true
+			} else {
+				messagesReceived += 1
+				bytesReceived += (len(m.Data) + len(m.Header) + len(m.Reply) + len(m.Subject))
+			}
+		case <-time.After(100 + 250*time.Millisecond):
+			t.Fatalf("Did not receive all the msgs in time")
+		}
+	}
+
+	// Now resend the request but then shutdown the server and
+	// make sure we have the same info.
+	err = nc.PublishRequest(rsubj, reply, jreq)
+	require_NoError(t, err)
+	natsFlush(t, nc)
+
+	s.Shutdown()
+
+	// It is possible that the client did not receive, so let's not fail
+	// on that. But if the 409 indicating the the server is shutdown
+	// is received, then it should have the new headers.
+	messagesReceived, bytesReceived = 0, 0
+	select {
+	case m := <-msgs:
+		checkHeaders("409", "Server Shutdown", m)
+	case <-time.After(500 * time.Millisecond):
+		// we can't fail for that.
+		t.Logf("Subscription did not receive the pull request response on server shutdown")
+	}
+}
+
+// For issue https://github.com/nats-io/nats-server/issues/3612
+// Do auto cleanup.
+func TestJetStreamDanglingMessageAutoCleanup(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.InterestPolicy,
+	})
+	require_NoError(t, err)
+
+	sub, err := js.PullSubscribe("foo", "dlc", nats.MaxAckPending(10))
+	require_NoError(t, err)
+
+	// Send 100 msgs
+	n := 100
+	for i := 0; i < n; i++ {
+		sendStreamMsg(t, nc, "foo", "msg")
+	}
+
+	// Grab and ack 10 messages.
+	for _, m := range fetchMsgs(t, sub, 10, time.Second) {
+		m.AckSync()
+	}
+
+	ci, err := sub.ConsumerInfo()
+	require_NoError(t, err)
+	require_True(t, ci.AckFloor.Stream == 10)
+
+	// Stop current
+	sd := s.JetStreamConfig().StoreDir
+	s.Shutdown()
+
+	// We will hand move the ackfloor to simulate dangling message condition.
+	cstore := filepath.Join(sd, "$G", "streams", "TEST", "obs", "dlc", "o.dat")
+
+	buf, err := os.ReadFile(cstore)
+	require_NoError(t, err)
+
+	state, err := decodeConsumerState(buf)
+	require_NoError(t, err)
+
+	// Update from 10 for delivered and ack to 90.
+	state.Delivered.Stream, state.Delivered.Consumer = 90, 90
+	state.AckFloor.Stream, state.AckFloor.Consumer = 90, 90
+
+	err = os.WriteFile(cstore, encodeConsumerState(state), defaultFilePerms)
+	require_NoError(t, err)
+
+	// Restart.
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	if si.State.Msgs != 10 {
+		t.Fatalf("Expected auto-cleanup to have worked but got %d msgs vs 10", si.State.Msgs)
+	}
+}
+
+// Issue https://github.com/nats-io/nats-server/issues/3645
+func TestJetStreamMsgIDHeaderCollision(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"ORDERS.*"},
+	})
+	require_NoError(t, err)
+
+	m := nats.NewMsg("ORDERS.test")
+	m.Header.Add(JSMsgId, "1")
+	m.Data = []byte("ok")
+
+	_, err = js.PublishMsg(m)
+	require_NoError(t, err)
+
+	m.Header = make(nats.Header)
+	m.Header.Add("Orig-Nats-Msg-Id", "1")
+
+	_, err = js.PublishMsg(m)
+	require_NoError(t, err)
+
+	m.Header = make(nats.Header)
+	m.Header.Add("Original-Nats-Msg-Id", "1")
+
+	_, err = js.PublishMsg(m)
+	require_NoError(t, err)
+
+	m.Header = make(nats.Header)
+	m.Header.Add("Original-Nats-Msg-Id", "1")
+	m.Header.Add("Really-Original-Nats-Msg-Id", "1")
+
+	_, err = js.PublishMsg(m)
+	require_NoError(t, err)
+
+	m.Header = make(nats.Header)
+	m.Header.Add("X", "Nats-Msg-Id:1")
+
+	_, err = js.PublishMsg(m)
+	require_NoError(t, err)
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	require_True(t, si.State.Msgs == 5)
 }

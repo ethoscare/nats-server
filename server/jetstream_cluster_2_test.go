@@ -2034,16 +2034,15 @@ func TestJetStreamClusterMaxConsumersMultipleConcurrentRequests(t *testing.T) {
 
 	startCh := make(chan bool)
 	var wg sync.WaitGroup
-
+	wg.Add(10)
 	for n := 0; n < 10; n++ {
-		wg.Add(1)
-		go func() {
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+		go func(js nats.JetStreamContext) {
 			defer wg.Done()
-			nc, js := jsClientConnect(t, c.randomServer())
-			defer nc.Close()
 			<-startCh
 			js.SubscribeSync("in.maxcc.foo")
-		}()
+		}(js)
 	}
 	// Wait for Go routines.
 	time.Sleep(250 * time.Millisecond)
@@ -2052,6 +2051,97 @@ func TestJetStreamClusterMaxConsumersMultipleConcurrentRequests(t *testing.T) {
 	wg.Wait()
 
 	var names []string
+	for n := range js.ConsumerNames("MAXCC") {
+		names = append(names, n)
+	}
+	if nc := len(names); nc > 1 {
+		t.Fatalf("Expected only 1 consumer, got %d", nc)
+	}
+}
+
+func TestJetStreamClusterAccountMaxStreamsAndConsumersMultipleConcurrentRequests(t *testing.T) {
+	tmpl := `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+
+	leaf {
+		listen: 127.0.0.1:-1
+	}
+
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+
+	accounts {
+		A {
+			jetstream {
+				max_file: 9663676416
+				max_streams: 2
+				max_consumers: 1
+			}
+			users = [ { user: "a", pass: "pwd" } ]
+		}
+		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+	}
+	`
+	c := createJetStreamClusterWithTemplate(t, tmpl, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer(), nats.UserInfo("a", "pwd"))
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{
+		Name:     "MAXCC",
+		Storage:  nats.MemoryStorage,
+		Subjects: []string{"in.maxcc.>"},
+		Replicas: 3,
+	}
+	if _, err := js.AddStream(cfg); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	si, err := js.StreamInfo("MAXCC")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if si.Config.MaxConsumers != -1 {
+		t.Fatalf("Expected max of -1, got %d", si.Config.MaxConsumers)
+	}
+
+	startCh := make(chan bool)
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for n := 0; n < 10; n++ {
+		nc, js := jsClientConnect(t, c.randomServer(), nats.UserInfo("a", "pwd"))
+		defer nc.Close()
+		go func(js nats.JetStreamContext, idx int) {
+			defer wg.Done()
+			<-startCh
+			// Test adding new streams
+			js.AddStream(&nats.StreamConfig{
+				Name:     fmt.Sprintf("OTHER_%d", idx),
+				Replicas: 3,
+			})
+			// Test adding consumers to MAXCC stream
+			js.SubscribeSync("in.maxcc.foo", nats.BindStream("MAXCC"))
+		}(js, n)
+	}
+	// Wait for Go routines.
+	time.Sleep(250 * time.Millisecond)
+
+	close(startCh)
+	wg.Wait()
+
+	var names []string
+	for n := range js.StreamNames() {
+		names = append(names, n)
+	}
+	if nc := len(names); nc > 2 {
+		t.Fatalf("Expected only 2 streams, got %d", nc)
+	}
+	names = names[:0]
 	for n := range js.ConsumerNames("MAXCC") {
 		names = append(names, n)
 	}
@@ -2431,6 +2521,8 @@ func TestJetStreamClusterRaceOnRAFTCreate(t *testing.T) {
 		t.Fatalf("Error creating stream: %v", err)
 	}
 
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
 	js, err = nc.JetStream(nats.MaxWait(2 * time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -2440,12 +2532,12 @@ func TestJetStreamClusterRaceOnRAFTCreate(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(size)
 	for i := 0; i < size; i++ {
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			if _, err := js.PullSubscribe("foo", "shared"); err != nil {
-				t.Errorf("Unexpected error on %v: %v", i, err)
-			}
-		}(i)
+			// We don't care about possible failures here, we just want
+			// parallel creation of a consumer.
+			js.PullSubscribe("foo", "shared")
+		}()
 	}
 	wg.Wait()
 }
@@ -3235,86 +3327,6 @@ func TestJetStreamClusterStreamUpdateSyncBug(t *testing.T) {
 	if !reflect.DeepEqual(cloneState, leaderState) {
 		t.Fatalf("States do not match: %+v vs %+v", cloneState, leaderState)
 	}
-}
-
-func TestJetStreamClusterStreamUpdateMissingBeginning(t *testing.T) {
-	c := createJetStreamClusterExplicit(t, "R3S", 3)
-	defer c.shutdown()
-
-	// Client based API
-	s := c.randomServer()
-	nc, js := jsClientConnect(t, s)
-	defer nc.Close()
-
-	cfg := &nats.StreamConfig{
-		Name:     "TEST",
-		Subjects: []string{"foo"},
-		Replicas: 3,
-	}
-	if _, err := js.AddStream(cfg); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	msg, toSend := []byte("OK"), 100
-	for i := 0; i < toSend; i++ {
-		if _, err := js.PublishAsync("foo", msg); err != nil {
-			t.Fatalf("Unexpected publish error: %v", err)
-		}
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Did not receive completion signal")
-	}
-
-	nsl := c.randomNonStreamLeader("$G", "TEST")
-	// Delete the first 50 messages manually from only this server.
-	mset, _ := nsl.GlobalAccount().lookupStream("TEST")
-	if _, err := mset.purge(&JSApiStreamPurgeRequest{Sequence: 50}); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	// Now shutdown.
-	nsl.Shutdown()
-	// make sure a leader exists
-	c.waitOnStreamLeader("$G", "TEST")
-
-	for i := 0; i < toSend; i++ {
-		if _, err := js.PublishAsync("foo", msg); err != nil {
-			t.Fatalf("Unexpected publish error: %v", err)
-		}
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Did not receive completion signal")
-	}
-
-	// We need to snapshot to force upper layer catchup vs RAFT layer.
-	mset, err := c.streamLeader("$G", "TEST").GlobalAccount().lookupStream("TEST")
-	if err != nil {
-		t.Fatalf("Expected to find a stream for %q", "TEST")
-	}
-	if err := mset.raftNode().InstallSnapshot(mset.stateSnapshot()); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	nsl = c.restartServer(nsl)
-	c.waitOnStreamCurrent(nsl, "$G", "TEST")
-
-	leaderState := mset.state()
-
-	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
-		mset, _ = nsl.GlobalAccount().lookupStream("TEST")
-		cloneState := mset.state()
-
-		if reflect.DeepEqual(cloneState, leaderState) {
-			return nil
-		} else {
-			return fmt.Errorf("States do not match: %+v vs %+v", cloneState, leaderState)
-		}
-	})
-
 }
 
 // Issue #2666

@@ -5399,7 +5399,7 @@ func TestNoRaceJetStreamFileStoreLargeKVAccessTiming(t *testing.T) {
 	}
 
 	fs, err := newFileStore(
-		FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize, CacheExpire: 5 * time.Second},
+		FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize, CacheExpire: 30 * time.Second},
 		StreamConfig{Name: "zzz", Subjects: []string{"KV.STREAM_NAME.*"}, Storage: FileStorage, MaxMsgsPer: 1},
 	)
 	require_NoError(t, err)
@@ -5418,16 +5418,20 @@ func TestNoRaceJetStreamFileStoreLargeKVAccessTiming(t *testing.T) {
 	last := fmt.Sprintf(tmpl, nkeys)
 
 	start := time.Now()
-	_, err = fs.LoadLastMsg(last, nil)
+	sm, err := fs.LoadLastMsg(last, nil)
 	require_NoError(t, err)
 	base := time.Since(start)
+
+	if !bytes.Equal(sm.msg, val) {
+		t.Fatalf("Retrieved value did not match")
+	}
 
 	start = time.Now()
 	_, err = fs.LoadLastMsg(first, nil)
 	require_NoError(t, err)
 	slow := time.Since(start)
 
-	if slow > 2*base {
+	if slow > 4*base || slow > time.Millisecond {
 		t.Fatalf("Took too long to look up first key vs last: %v vs %v", base, slow)
 	}
 
@@ -5442,7 +5446,7 @@ func TestNoRaceJetStreamFileStoreLargeKVAccessTiming(t *testing.T) {
 	slow = time.Since(start)
 	fs.mu.RUnlock()
 
-	if slow > 2*base {
+	if slow > 4*base || slow > time.Millisecond {
 		t.Fatalf("Took too long to look up last key by subject vs first: %v vs %v", base, slow)
 	}
 }
@@ -5723,4 +5727,155 @@ func TestNoRaceJetStreamManyPullConsumersNeedAckOptimization(t *testing.T) {
 
 	last := msgs[len(msgs)-1]
 	last.AckSync()
+}
+
+// https://github.com/nats-io/nats-server/issues/3499
+func TestNoRaceJetStreamDeleteConsumerWithInterestStreamAndHighSeqs(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"log.>"},
+		Retention: nats.InterestPolicy,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "c",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// Set baseline for time to delete so we can see linear increase as sequence numbers increase.
+	start := time.Now()
+	err = js.DeleteConsumer("TEST", "c")
+	require_NoError(t, err)
+	elapsed := time.Since(start)
+
+	// Crank up sequence numbers.
+	msg := []byte(strings.Repeat("ZZZ", 128))
+	for i := 0; i < 5_000_000; i++ {
+		nc.Publish("log.Z", msg)
+	}
+	nc.Flush()
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "c",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// We have a bug that spins unecessarily through all the sequences from this consumer's
+	// ackfloor(0) and the last sequence for the stream. We will detect by looking for the time
+	// to delete being 100x more. Should be the same since both times no messages exist in the stream.
+	start = time.Now()
+	err = js.DeleteConsumer("TEST", "c")
+	require_NoError(t, err)
+
+	if e := time.Since(start); e > 100*elapsed {
+		t.Fatalf("Consumer delete took too long: %v vs baseline %v", e, elapsed)
+	}
+}
+
+// Performance impact on stream ingress with large number of consumers.
+func TestJetStreamLargeNumConsumersPerfImpact(t *testing.T) {
+	skip(t)
+
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	// Baseline with no consumers.
+	toSend := 1_000_000
+	start := time.Now()
+	for i := 0; i < toSend; i++ {
+		js.PublishAsync("foo", []byte("OK"))
+	}
+	<-js.PublishAsyncComplete()
+	tt := time.Since(start)
+	fmt.Printf("Base time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
+
+	err = js.PurgeStream("TEST")
+	require_NoError(t, err)
+
+	// Now add in 10 idle consumers.
+	for i := 1; i <= 10; i++ {
+		_, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:   fmt.Sprintf("d-%d", i),
+			AckPolicy: nats.AckExplicitPolicy,
+		})
+		require_NoError(t, err)
+	}
+
+	start = time.Now()
+	for i := 0; i < toSend; i++ {
+		js.PublishAsync("foo", []byte("OK"))
+	}
+	<-js.PublishAsyncComplete()
+	tt = time.Since(start)
+	fmt.Printf("\n10 consumers time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
+
+	err = js.PurgeStream("TEST")
+	require_NoError(t, err)
+
+	// Now add in 90 more idle consumers.
+	for i := 11; i <= 100; i++ {
+		_, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:   fmt.Sprintf("d-%d", i),
+			AckPolicy: nats.AckExplicitPolicy,
+		})
+		require_NoError(t, err)
+	}
+
+	start = time.Now()
+	for i := 0; i < toSend; i++ {
+		js.PublishAsync("foo", []byte("OK"))
+	}
+	<-js.PublishAsyncComplete()
+	tt = time.Since(start)
+	fmt.Printf("\n100 consumers time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
+
+	err = js.PurgeStream("TEST")
+	require_NoError(t, err)
+
+	// Now add in 900 more
+	for i := 101; i <= 1000; i++ {
+		_, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:   fmt.Sprintf("d-%d", i),
+			AckPolicy: nats.AckExplicitPolicy,
+		})
+		require_NoError(t, err)
+	}
+
+	start = time.Now()
+	for i := 0; i < toSend; i++ {
+		js.PublishAsync("foo", []byte("OK"))
+	}
+	<-js.PublishAsyncComplete()
+	tt = time.Since(start)
+	fmt.Printf("\n1000 consumers time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
 }

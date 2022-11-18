@@ -1593,3 +1593,170 @@ func TestClusterQueueGroupWeightTrackingLeak(t *testing.T) {
 	checkSubGone(s)
 	checkSubGone(s2)
 }
+
+type testRouteReconnectLogger struct {
+	DummyLogger
+	ch chan string
+}
+
+func (l *testRouteReconnectLogger) Debugf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	if strings.Contains(msg, "Trying to connect to route") {
+		select {
+		case l.ch <- msg:
+		default:
+		}
+	}
+}
+
+func TestRouteSolicitedReconnectsEvenIfImplicit(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.ServerName = "A"
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	o2 := DefaultOptions()
+	o2.ServerName = "B"
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	// Not strictly required to reconnect, but if the reconnect were to fail for any reason
+	// then the server would retry only once and then stops. So set it to some higher value
+	// and then we will check that the server does not try more than that.
+	o2.Cluster.ConnectRetries = 3
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	o3 := DefaultOptions()
+	o3.ServerName = "C"
+	o3.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	o3.Cluster.ConnectRetries = 3
+	s3 := RunServer(o3)
+	defer s3.Shutdown()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	s2.mu.Lock()
+	for _, r := range s2.routes {
+		r.mu.Lock()
+		// Close the route between S2 and S3 (that do not have explicit route to each other)
+		if r.route.remoteID == s3.ID() {
+			r.nc.Close()
+		}
+		r.mu.Unlock()
+	}
+	s2.mu.Unlock()
+	// Wait a bit to make sure that we don't check for cluster formed too soon (need to make
+	// sure that connection is really removed and reconnect mechanism starts).
+	time.Sleep(100 * time.Millisecond)
+	checkClusterFormed(t, s1, s2, s3)
+
+	// Now shutdown server 3 and make sure that s2 stops trying to reconnect to s3 at one point
+	l := &testRouteReconnectLogger{ch: make(chan string, 10)}
+	s2.SetLogger(l, true, false)
+	s3.Shutdown()
+	// S2 should retry ConnectRetries+1 times and then stop
+	for i := 0; i < o2.Cluster.ConnectRetries+1; i++ {
+		select {
+		case <-l.ch:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Did not attempt to reconnect")
+		}
+	}
+	// Now it should have stopped (in tests, reconnect delay is down to 15ms, so we don't need
+	// to wait for too long).
+	select {
+	case msg := <-l.ch:
+		t.Fatalf("Unexpected attempt to reconnect: %s", msg)
+	case <-time.After(50 * time.Millisecond):
+		// OK
+	}
+}
+
+func TestRouteSaveTLSName(t *testing.T) {
+	c1Conf := createConfFile(t, []byte(`
+		port: -1
+		cluster {
+			name: "abc"
+			port: -1
+			tls {
+				cert_file: '../test/configs/certs/server-noip.pem'
+				key_file: '../test/configs/certs/server-key-noip.pem'
+				ca_file: '../test/configs/certs/ca.pem'
+			}
+		}
+	`))
+	defer removeFile(t, c1Conf)
+	s1, o1 := RunServerWithConfig(c1Conf)
+	defer s1.Shutdown()
+
+	tmpl := `
+	port: -1
+	cluster {
+		name: "abc"
+		port: -1
+		routes: ["nats://%s:%d"]
+		tls {
+			cert_file: '../test/configs/certs/server-noip.pem'
+			key_file: '../test/configs/certs/server-key-noip.pem'
+			ca_file: '../test/configs/certs/ca.pem'
+		}
+	}
+	`
+	c2And3Conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "localhost", o1.Cluster.Port)))
+	defer removeFile(t, c2And3Conf)
+	s2, _ := RunServerWithConfig(c2And3Conf)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	s3, _ := RunServerWithConfig(c2And3Conf)
+	defer s3.Shutdown()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	reloadUpdateConfig(t, s2, c2And3Conf, fmt.Sprintf(tmpl, "127.0.0.1", o1.Cluster.Port))
+
+	s2.mu.RLock()
+	for _, r := range s2.routes {
+		r.mu.Lock()
+		if r.route.routeType == Implicit {
+			r.nc.Close()
+		}
+		r.mu.Unlock()
+	}
+	s2.mu.RUnlock()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	// Set a logger to capture errors trying to connect after clearing
+	// the routeTLSName and causing a disconnect
+	l := &captureErrorLogger{errCh: make(chan string, 1)}
+	s2.SetLogger(l, false, false)
+
+	var gotIt bool
+	for i := 0; !gotIt && i < 5; i++ {
+		s2.mu.Lock()
+		s2.routeTLSName = _EMPTY_
+		for _, r := range s2.routes {
+			r.mu.Lock()
+			if r.route.routeType == Implicit {
+				r.nc.Close()
+			}
+			r.mu.Unlock()
+		}
+		s2.mu.Unlock()
+		select {
+		case <-l.errCh:
+			gotIt = true
+		case <-time.After(time.Second):
+			// Try again
+		}
+	}
+	if !gotIt {
+		t.Fatal("Did not get the handshake error")
+	}
+
+	// Now get back to localhost in config and reload config and
+	// it should start to work again.
+	reloadUpdateConfig(t, s2, c2And3Conf, fmt.Sprintf(tmpl, "localhost", o1.Cluster.Port))
+	checkClusterFormed(t, s1, s2, s3)
+}

@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -4676,5 +4677,166 @@ func TestFileStoreFilteredFirstMatchingBug(t *testing.T) {
 	sm, _, err := fs.LoadNextMsg("foo.foo", false, 4, nil)
 	if err == nil || sm != nil {
 		t.Fatalf("Loaded filtered message with wrong subject, wanted %q got %q", "foo.foo", sm.subj)
+	}
+}
+
+func TestFileStoreOutOfSpaceRebuildState(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Subjects: []string{"*"}, Storage: FileStorage},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	_, _, err = fs.StoreMsg("foo", nil, []byte("A"))
+	require_NoError(t, err)
+
+	_, _, err = fs.StoreMsg("bar", nil, []byte("B"))
+	require_NoError(t, err)
+
+	// Grab state.
+	state := fs.State()
+	ss := fs.SubjectsState(">")
+
+	// Set mock out of space error to trip.
+	fs.mu.RLock()
+	mb := fs.lmb
+	fs.mu.RUnlock()
+
+	mb.mu.Lock()
+	mb.mockWriteErr = true
+	mb.mu.Unlock()
+
+	_, _, err = fs.StoreMsg("baz", nil, []byte("C"))
+	require_Error(t, err, errors.New("mock write error"))
+
+	nstate := fs.State()
+	nss := fs.SubjectsState(">")
+
+	if !reflect.DeepEqual(state, nstate) {
+		t.Fatalf("State expected to be\n  %+v\nvs\n  %+v", state, nstate)
+	}
+
+	if !reflect.DeepEqual(ss, nss) {
+		t.Fatalf("Subject state expected to be\n  %+v\nvs\n  %+v", ss, nss)
+	}
+}
+
+func TestFileStoreRebuildStateProperlyWithMaxMsgsPerSubject(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 4096},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo", "bar", "baz"}, Storage: FileStorage, MaxMsgsPer: 1},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Send one to baz at beginning.
+	_, _, err = fs.StoreMsg("baz", nil, nil)
+	require_NoError(t, err)
+
+	ns := 1000
+	for i := 1; i <= ns; i++ {
+		_, _, err := fs.StoreMsg("foo", nil, nil)
+		require_NoError(t, err)
+		_, _, err = fs.StoreMsg("bar", nil, nil)
+		require_NoError(t, err)
+	}
+
+	checkState := func() {
+		var ss StreamState
+		fs.FastState(&ss)
+		if ss.NumSubjects != 3 {
+			t.Fatalf("Expected NumSubjects of 3, got %d", ss.NumSubjects)
+		}
+		if ss.Msgs != 3 {
+			t.Fatalf("Expected NumMsgs of 3, got %d", ss.Msgs)
+		}
+	}
+
+	checkState()
+
+	// Stop filestore but invalidate the idx files by removing them.
+	// This will simulate a server panic or kill -9 scenario.
+	fs.Stop()
+
+	fs.mu.RLock()
+	for _, mb := range fs.blks {
+		mb.removeIndexFile()
+	}
+	fs.mu.RUnlock()
+
+	fs, err = newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 4096},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo", "bar", "baz"}, Storage: FileStorage, MaxMsgsPer: 1},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	checkState()
+
+	// Make sure we wrote all index files from recovery.
+	fs.mu.RLock()
+	for _, mb := range fs.blks {
+		mb.mu.Lock()
+		if err := mb.readIndexInfo(); err != nil {
+			mb.mu.Unlock()
+			fs.mu.RUnlock()
+			t.Fatalf("Unexpected error reading index info: %v", err)
+		}
+		if mb.msgs == 0 {
+			mb.mu.Unlock()
+			fs.mu.RUnlock()
+			t.Fatalf("Expected msgs for all blks, got none for index %d", mb.index)
+		}
+		mb.mu.Unlock()
+	}
+	fs.mu.RUnlock()
+}
+
+func TestFileStoreUpdateMaxMsgsPerSubject(t *testing.T) {
+	cfg := StreamConfig{
+		Name:       "TEST",
+		Storage:    FileStorage,
+		Subjects:   []string{"foo"},
+		MaxMsgsPer: 10,
+	}
+
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Make sure this is honored on an update.
+	cfg.MaxMsgsPer = 50
+	err = fs.UpdateConfig(&cfg)
+	require_NoError(t, err)
+
+	numStored := 22
+	for i := 0; i < numStored; i++ {
+		_, _, err = fs.StoreMsg("foo", nil, nil)
+		require_NoError(t, err)
+	}
+
+	ss := fs.SubjectsState("foo")["foo"]
+	if ss.Msgs != uint64(numStored) {
+		t.Fatalf("Expected to have %d stored, got %d", numStored, ss.Msgs)
+	}
+
+	// Now make sure we trunk if setting to lower value.
+	cfg.MaxMsgsPer = 10
+	err = fs.UpdateConfig(&cfg)
+	require_NoError(t, err)
+
+	ss = fs.SubjectsState("foo")["foo"]
+	if ss.Msgs != 10 {
+		t.Fatalf("Expected to have %d stored, got %d", 10, ss.Msgs)
 	}
 }
