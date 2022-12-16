@@ -62,6 +62,10 @@ const (
 	remoteLatencyEventSubj   = "$SYS.LATENCY.M2.%s"
 	inboxRespSubj            = "$SYS._INBOX.%s.%s"
 
+	// Used to return information to a user on bound account and user permissions.
+	userDirectInfoSubj = "$SYS.REQ.USER.INFO"
+	userDirectReqSubj  = "$SYS.REQ.USER.%s.INFO"
+
 	// FIXME(dlc) - Should account scope, even with wc for now, but later on
 	// we can then shard as needed.
 	accNumSubsReqSubj = "$SYS.REQ.ACCOUNT.NSUBS"
@@ -161,6 +165,13 @@ const AccountNumConnsMsgType = "io.nats.server.advisory.v1.account_connections"
 type accNumConnsReq struct {
 	Server  ServerInfo `json:"server"`
 	Account string     `json:"acc"`
+}
+
+// ServerID is basic static info for a server.
+type ServerID struct {
+	Name string `json:"name"`
+	Host string `json:"host"`
+	ID   string `json:"id"`
 }
 
 // ServerInfo identifies remote servers.
@@ -881,6 +892,7 @@ func (s *Server) initEventTracking() {
 		s.Errorf("Error setting up internal tracking: %v", err)
 	}
 	monSrvc := map[string]msgHandler{
+		"IDZ":    s.idzReq,
 		"STATSZ": s.statszReq,
 		"VARZ": func(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
 			optz := &VarzEventOptions{}
@@ -1022,6 +1034,13 @@ func (s *Server) initEventTracking() {
 		}
 	}
 
+	// User info.
+	// TODO(dlc) - Can be internal and not forwarded since bound server for the client connection
+	// is only one that will answer. This breaks tests since we still forward on remote server connect.
+	if _, err := s.sysSubscribe(fmt.Sprintf(userDirectReqSubj, "*"), s.userInfoReq); err != nil {
+		s.Errorf("Error setting up internal tracking: %v", err)
+	}
+
 	// For now only the STATZ subject has an account specific ping equivalent.
 	if _, err := s.sysSubscribe(fmt.Sprintf(accPingReqSubj, "STATZ"),
 		func(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
@@ -1054,6 +1073,40 @@ func (s *Server) initEventTracking() {
 	if _, err := s.sysSubscribeInternal(accSubsSubj, s.debugSubscribers); err != nil {
 		s.Errorf("Error setting up internal debug service for subscribers: %v", err)
 	}
+}
+
+// UserInfo returns basic information to a user about bound account and user permissions.
+// For account information they will need to ping that separately, and this allows security
+// controls on each subsystem if desired, e.g. account info, jetstream account info, etc.
+type UserInfo struct {
+	UserID      string        `json:"user"`
+	Account     string        `json:"account"`
+	Permissions *Permissions  `json:"permissions,omitempty"`
+	Expires     time.Duration `json:"expires,omitempty"`
+}
+
+// Process a user info request.
+func (s *Server) userInfoReq(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
+	if !s.EventsEnabled() || reply == _EMPTY_ {
+		return
+	}
+
+	response := &ServerAPIResponse{Server: &ServerInfo{}}
+
+	ci, _, _, _, err := s.getRequestInfo(c, msg)
+	if err != nil {
+		response.Error = &ApiError{Code: http.StatusBadRequest}
+		s.sendInternalResponse(reply, response)
+		return
+	}
+
+	response.Data = &UserInfo{
+		UserID:      ci.User,
+		Account:     ci.Account,
+		Permissions: c.publicPermissions(),
+		Expires:     c.claimExpiration(),
+	}
+	s.sendInternalResponse(reply, response)
 }
 
 // register existing accounts with any system exports.
@@ -1107,6 +1160,20 @@ func (s *Server) addSystemAccountExports(sacc *Account) {
 		if err := sacc.AddServiceExport(accSubsSubj, nil); err != nil {
 			s.Errorf("Error adding system service export for %q: %v", accSubsSubj, err)
 		}
+	}
+
+	// User info export.
+	userInfoSubj := fmt.Sprintf(userDirectReqSubj, "*")
+	if !sacc.hasServiceExportMatching(userInfoSubj) {
+		if err := sacc.AddServiceExport(userInfoSubj, nil); err != nil {
+			s.Errorf("Error adding system service export for %q: %v", userInfoSubj, err)
+		}
+		mappedSubj := fmt.Sprintf(userDirectReqSubj, sacc.GetName())
+		if err := sacc.AddServiceImport(sacc, userDirectInfoSubj, mappedSubj); err != nil {
+			s.Errorf("Error setting up system service import %s: %v", mappedSubj, err)
+		}
+		// Make sure to share details.
+		sacc.setServiceImportSharing(sacc, mappedSubj, false, true)
 	}
 
 	// Register any accounts that existed prior.
@@ -1574,6 +1641,19 @@ func (s *Server) statszReq(sub *subscription, c *client, _ *Account, subject, re
 	s.mu.Unlock()
 }
 
+// idzReq is for a request for basic static server info.
+// Try to not hold the write lock or dynamically create data.
+func (s *Server) idzReq(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id := &ServerID{
+		Name: s.info.Name,
+		Host: s.info.Host,
+		ID:   s.info.ID,
+	}
+	s.sendInternalMsg(reply, _EMPTY_, nil, &id)
+}
+
 var errSkipZreq = errors.New("filtered response")
 
 const (
@@ -1700,6 +1780,12 @@ func (s *Server) registerSystemImports(a *Account) {
 	importSrvc(fmt.Sprintf(accPingReqSubj, "CONNZ"), mappedConnzSubj)
 	importSrvc(fmt.Sprintf(serverPingReqSubj, "CONNZ"), mappedConnzSubj)
 	importSrvc(fmt.Sprintf(accPingReqSubj, "STATZ"), fmt.Sprintf(accDirectReqSubj, a.Name, "STATZ"))
+
+	// This is for user's looking up their own info.
+	mappedSubject := fmt.Sprintf(userDirectReqSubj, a.Name)
+	importSrvc(userDirectInfoSubj, mappedSubject)
+	// Make sure to share details.
+	a.setServiceImportSharing(sacc, mappedSubject, false, true)
 }
 
 // Setup tracking for this account. This allows us to track global account activity.

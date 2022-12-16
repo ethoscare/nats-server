@@ -16,6 +16,7 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -222,11 +223,12 @@ type stream struct {
 	// For republishing.
 	tr *transform
 
-	// For processing consumers as a list without main stream lock.
+	// For processing consumers without main stream lock.
 	clsMu sync.RWMutex
 	cList []*consumer
 	sch   chan struct{}
 	sigq  *ipQueue // of *cMsg
+	csl   *Sublist
 
 	// TODO(dlc) - Hide everything below behind two pointers.
 	// Clustered mode.
@@ -411,7 +413,7 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 
 	// Check for overlapping subjects with other streams.
 	// These are not allowed for now.
-	if jsa.subjectsOverlap(cfg.Subjects) {
+	if jsa.subjectsOverlap(cfg.Subjects, nil) {
 		jsa.mu.Unlock()
 		return nil, NewJSStreamSubjectOverlapError()
 	}
@@ -908,10 +910,14 @@ func (mset *stream) setCreatedTime(created time.Time) {
 	mset.mu.Unlock()
 }
 
-// Check to see if these subjects overlap with existing subjects.
-// Lock should be held.
-func (jsa *jsAccount) subjectsOverlap(subjects []string) bool {
+// subjectsOverlap to see if these subjects overlap with existing subjects.
+// Use only for non-clustered JetStream
+// RLock minimum should be held.
+func (jsa *jsAccount) subjectsOverlap(subjects []string, self *stream) bool {
 	for _, mset := range jsa.streams {
+		if self != nil && mset == self {
+			continue
+		}
 		for _, subj := range mset.cfg.Subjects {
 			for _, tsubj := range subjects {
 				if SubjectsCollide(tsubj, subj) {
@@ -1199,7 +1205,8 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account) (StreamConfi
 			return StreamConfig{}, NewJSMirrorWithSubjectsError()
 		}
 
-		// We can allow overlaps, but don't allow direct duplicates.
+		// Check for literal duplication of subject interest in config
+		// and no overlap with any JS API subject space
 		dset := make(map[string]struct{}, len(cfg.Subjects))
 		for _, subj := range cfg.Subjects {
 			if _, ok := dset[subj]; ok {
@@ -1432,14 +1439,27 @@ func (mset *stream) update(config *StreamConfig) error {
 
 // Update will allow certain configuration properties of an existing stream to be updated.
 func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool) error {
+	_, jsa, err := mset.acc.checkForJetStream()
+	if err != nil {
+		return err
+	}
+
 	mset.mu.RLock()
 	ocfg := mset.cfg
 	s := mset.srv
 	mset.mu.RUnlock()
+
 	cfg, err := mset.jsa.configUpdateCheck(&ocfg, config, s)
 	if err != nil {
 		return NewJSStreamInvalidConfigError(err, Unless(err))
 	}
+
+	jsa.mu.RLock()
+	if jsa.subjectsOverlap(cfg.Subjects, mset) {
+		jsa.mu.RUnlock()
+		return NewJSStreamSubjectOverlapError()
+	}
+	jsa.mu.RUnlock()
 
 	mset.mu.Lock()
 	if mset.isLeader() {
@@ -3965,7 +3985,7 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 
 		switch err {
 		case ErrMaxMsgs, ErrMaxBytes, ErrMaxMsgsPerSubject, ErrMsgTooLarge:
-			s.Debugf("JetStream failed to store a msg on stream '%s > %s': %v", accName, name, err)
+			s.RateLimitDebugf("JetStream failed to store a msg on stream '%s > %s': %v", accName, name, err)
 		case ErrStoreClosed:
 		default:
 			s.Errorf("JetStream failed to store a msg on stream '%s > %s': %v", accName, name, err)
@@ -4053,22 +4073,15 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 
 	// Signal consumers for new messages.
 	if numConsumers > 0 {
-		if numConsumers > consumerSignalThreshold {
-			mset.sigq.push(newCMsg(subject, seq))
-			select {
-			case mset.sch <- struct{}{}:
-			default:
-			}
-		} else {
-			mset.signalConsumers(subject, seq)
+		mset.sigq.push(newCMsg(subject, seq))
+		select {
+		case mset.sch <- struct{}{}:
+		default:
 		}
 	}
 
 	return nil
 }
-
-// Number of consumers to consider offloading signal processing.
-const consumerSignalThreshold = 10
 
 // Used to signal inbound message to registered consumers.
 type cMsg struct {
@@ -4133,19 +4146,21 @@ func (mset *stream) signalConsumers(subj string, seq uint64) {
 	mset.clsMu.RLock()
 	defer mset.clsMu.RUnlock()
 
-	for _, o := range mset.cList {
-		o.mu.Lock()
-		if o.isLeader() && o.isFilteredMatch(subj) {
-			if seq > o.npcm {
-				o.npc++
-			}
-			if o.mset != nil {
-				if o.isPushMode() && o.active || o.isPullMode() && !o.waiting.isEmpty() {
-					o.signalNewMessages()
-				}
-			}
-		}
-		o.mu.Unlock()
+	if mset.csl == nil {
+		return
+	}
+
+	r := mset.csl.Match(subj)
+	if len(r.psubs) == 0 {
+		return
+	}
+	// Encode the sequence here.
+	var eseq [8]byte
+	var le = binary.LittleEndian
+	le.PutUint64(eseq[:], seq)
+	msg := eseq[:]
+	for _, sub := range r.psubs {
+		sub.icb(sub, nil, nil, subj, _EMPTY_, msg)
 	}
 }
 
@@ -4407,7 +4422,7 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 		obs = append(obs, o)
 	}
 	mset.clsMu.Lock()
-	mset.consumers, mset.cList = nil, nil
+	mset.consumers, mset.cList, mset.csl = nil, nil, nil
 	mset.clsMu.Unlock()
 
 	// Check if we are a mirror.
@@ -4588,17 +4603,6 @@ func (mset *stream) numConsumers() int {
 	return len(mset.consumers)
 }
 
-// Lock should be held
-// Don't expect this to be called at high rates.
-func (mset *stream) updateConsumerList() {
-	mset.clsMu.Lock()
-	defer mset.clsMu.Unlock()
-	mset.cList = make([]*consumer, 0, len(mset.consumers))
-	for _, o := range mset.consumers {
-		mset.cList = append(mset.cList, o)
-	}
-}
-
 // Lock should be held.
 func (mset *stream) setConsumer(o *consumer) {
 	mset.consumers[o.name] = o
@@ -4609,7 +4613,9 @@ func (mset *stream) setConsumer(o *consumer) {
 		mset.directs++
 	}
 	// Now update consumers list as well
-	mset.updateConsumerList()
+	mset.clsMu.Lock()
+	mset.cList = append(mset.cList, o)
+	mset.clsMu.Unlock()
 }
 
 // Lock should be held.
@@ -4620,9 +4626,42 @@ func (mset *stream) removeConsumer(o *consumer) {
 	if o.cfg.Direct && mset.directs > 0 {
 		mset.directs--
 	}
-	delete(mset.consumers, o.name)
-	// Now update consumers list as well
-	mset.updateConsumerList()
+	if mset.consumers != nil {
+		delete(mset.consumers, o.name)
+		// Now update consumers list as well
+		mset.clsMu.Lock()
+		for i, ol := range mset.cList {
+			if ol == o {
+				mset.cList = append(mset.cList[:i], mset.cList[i+1:]...)
+				break
+			}
+		}
+		// Always remove from the leader sublist.
+		if mset.csl != nil {
+			mset.csl.Remove(o.signalSub())
+		}
+		mset.clsMu.Unlock()
+	}
+}
+
+// Set the consumer as a leader. This will update signaling sublist.
+func (mset *stream) setConsumerAsLeader(o *consumer) {
+	mset.clsMu.Lock()
+	defer mset.clsMu.Unlock()
+
+	if mset.csl == nil {
+		mset.csl = NewSublistWithCache()
+	}
+	mset.csl.Insert(o.signalSub())
+}
+
+// Remove the consumer as a leader. This will update signaling sublist.
+func (mset *stream) removeConsumerAsLeader(o *consumer) {
+	mset.clsMu.Lock()
+	defer mset.clsMu.Unlock()
+	if mset.csl != nil {
+		mset.csl.Remove(o.signalSub())
+	}
 }
 
 // lookupConsumer will retrieve a consumer by name.

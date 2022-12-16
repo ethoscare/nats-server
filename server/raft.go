@@ -1081,8 +1081,10 @@ func (n *raft) setupLastSnapshot() {
 	n.snapfile = latest
 	snap, err := n.loadLastSnapshot()
 	if err != nil {
-		os.Remove(n.snapfile)
-		n.snapfile = _EMPTY_
+		if n.snapfile != _EMPTY_ {
+			os.Remove(n.snapfile)
+			n.snapfile = _EMPTY_
+		}
 	} else {
 		n.pindex = snap.lastIndex
 		n.pterm = snap.lastTerm

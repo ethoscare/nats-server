@@ -1567,9 +1567,14 @@ func (a *Account) checkStreamImportsForCycles(to string, visited map[string]bool
 // SetServiceImportSharing will allow sharing of information about requests with the export account.
 // Used for service latency tracking at the moment.
 func (a *Account) SetServiceImportSharing(destination *Account, to string, allow bool) error {
+	return a.setServiceImportSharing(destination, to, true, allow)
+}
+
+// setServiceImportSharing will allow sharing of information about requests with the export account.
+func (a *Account) setServiceImportSharing(destination *Account, to string, check, allow bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.isClaimAccount() {
+	if check && a.isClaimAccount() {
 		return fmt.Errorf("claim based accounts can not be updated directly")
 	}
 	for _, si := range a.imports.services {
@@ -3817,9 +3822,13 @@ func removeCb(s *Server, pubKey string) {
 	a.mu.Unlock()
 	// set the account to be expired and disconnect clients
 	a.expiredTimeout()
-	// For JS, we need also to disable JS
+	// For JS, we need also to disable it.
 	if js := s.getJetStream(); js != nil && jsa != nil {
 		js.disableJetStream(jsa)
+		// Remove JetStream state in memory, this will be reset
+		// on the changed callback from the account in case it is
+		// enabled again.
+		a.js = nil
 	}
 	// We also need to remove all ServerImport subscriptions
 	a.removeAllServiceImportSubs()
@@ -3838,11 +3847,23 @@ func (dr *DirAccResolver) Start(s *Server) error {
 	dr.Server = s
 	dr.operator = opKeys
 	dr.DirJWTStore.changed = func(pubKey string) {
-		if v, ok := s.accounts.Load(pubKey); !ok {
-		} else if theJwt, err := dr.LoadAcc(pubKey); err != nil {
-			s.Errorf("update got error on load: %v", err)
-		} else if err := s.updateAccountWithClaimJWT(v.(*Account), theJwt); err != nil {
-			s.Errorf("update resulted in error %v", err)
+		if v, ok := s.accounts.Load(pubKey); ok {
+			if theJwt, err := dr.LoadAcc(pubKey); err != nil {
+				s.Errorf("update got error on load: %v", err)
+			} else {
+				acc := v.(*Account)
+				if err = s.updateAccountWithClaimJWT(acc, theJwt); err != nil {
+					s.Errorf("update resulted in error %v", err)
+				} else {
+					if _, jsa, err := acc.checkForJetStream(); err != nil {
+						s.Warnf("error checking for JetStream enabled error %v", err)
+					} else if jsa == nil {
+						if err = s.configJetStream(acc); err != nil {
+							s.Errorf("updated resulted in error when configuring JetStream %v", err)
+						}
+					}
+				}
+			}
 		}
 	}
 	dr.DirJWTStore.deleted = func(pubKey string) {

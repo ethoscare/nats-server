@@ -42,7 +42,10 @@ type jetStreamCluster struct {
 	streams map[string]map[string]*streamAssignment
 	// These are inflight proposals and used to apply limits when there are
 	// concurrent requests that would otherwise be accepted.
-	inflight map[string]map[string]struct{}
+	// We also record the group for the stream. This is needed since if we have
+	// concurrent requests for same account and stream we need to let it process to get
+	// a response but they need to be same group, peers etc.
+	inflight map[string]map[string]*raftGroup
 	// Signals meta-leader should check the stream assignments.
 	streamsCheck bool
 	// Server.
@@ -175,8 +178,8 @@ const (
 
 // Returns information useful in mixed mode.
 func (s *Server) trackedJetStreamServers() (js, total int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if !s.running || !s.eventsEnabled() {
 		return -1, -1
 	}
@@ -192,10 +195,10 @@ func (s *Server) trackedJetStreamServers() (js, total int) {
 }
 
 func (s *Server) getJetStreamCluster() (*jetStream, *jetStreamCluster) {
-	s.mu.Lock()
+	s.mu.RLock()
 	shutdown := s.shutdown
 	js := s.js
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	if shutdown || js == nil {
 		return nil, nil
@@ -428,6 +431,27 @@ func (cc *jetStreamCluster) isConsumerCurrent(account, stream, consumer string) 
 		return false
 	}
 	return true
+}
+
+// subjectsOverlap checks all existing stream assignments for the account cross-cluster for subject overlap
+// Use only for clustered JetStream
+// Read lock should be held.
+func (jsc *jetStreamCluster) subjectsOverlap(acc string, subjects []string, osa *streamAssignment) bool {
+	asa := jsc.streams[acc]
+	for _, sa := range asa {
+		// can't overlap yourself, assume osa pre-checked for deep equal if passed
+		if osa != nil && sa == osa {
+			continue
+		}
+		for _, subj := range sa.Config.Subjects {
+			for _, tsubj := range subjects {
+				if SubjectsCollide(tsubj, subj) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (a *Account) getJetStreamFromAccount() (*Server, *jetStream, *jsAccount) {
@@ -2532,7 +2556,7 @@ func (js *jetStream) processStreamLeaderChange(mset *stream, isLeader bool) {
 	streamName := mset.name()
 
 	if isLeader {
-		s.Noticef("JetStream cluster new stream leader for '%s > %s'", sa.Client.serviceAccount(), streamName)
+		s.Noticef("JetStream cluster new stream leader for '%s > %s'", account, streamName)
 		s.sendStreamLeaderElectAdvisory(mset)
 		// Check for peer removal and process here if needed.
 		js.checkPeers(sa.Group)
@@ -2709,20 +2733,23 @@ func (js *jetStream) processStreamAssignment(sa *streamAssignment) bool {
 	// Update our state.
 	accStreams[stream] = sa
 	cc.streams[accName] = accStreams
+	hasResponded := sa.responded
 	js.mu.Unlock()
 
 	acc, err := s.LookupAccount(accName)
 	if err != nil {
 		ll := fmt.Sprintf("Account [%s] lookup for stream create failed: %v", accName, err)
 		if isMember {
-			// If we can not lookup the account and we are a member, send this result back to the metacontroller leader.
-			result := &streamAssignmentResult{
-				Account:  accName,
-				Stream:   stream,
-				Response: &JSApiStreamCreateResponse{ApiResponse: ApiResponse{Type: JSApiStreamCreateResponseType}},
+			if !hasResponded {
+				// If we can not lookup the account and we are a member, send this result back to the metacontroller leader.
+				result := &streamAssignmentResult{
+					Account:  accName,
+					Stream:   stream,
+					Response: &JSApiStreamCreateResponse{ApiResponse: ApiResponse{Type: JSApiStreamCreateResponseType}},
+				}
+				result.Response.Error = NewJSNoAccountError()
+				s.sendInternalMsgLocked(streamAssignmentSubj, _EMPTY_, nil, result)
 			}
-			result.Response.Error = NewJSNoAccountError()
-			s.sendInternalMsgLocked(streamAssignmentSubj, _EMPTY_, nil, result)
 			s.Warnf(ll)
 		} else {
 			s.Debugf(ll)
@@ -2735,20 +2762,9 @@ func (js *jetStream) processStreamAssignment(sa *streamAssignment) bool {
 	// Check if this is for us..
 	if isMember {
 		js.processClusterCreateStream(acc, sa)
-	} else {
-		// Check if we have a raft node running, meaning we are no longer part of the group but were.
-		js.mu.Lock()
-		if node := sa.Group.node; node != nil {
-			if node.Leader() {
-				node.UpdateKnownPeers(sa.Group.Peers)
-				node.StepDown()
-			}
-			node.ProposeRemovePeer(ourID)
-			didRemove = true
-		}
-		sa.Group.node = nil
-		sa.err = nil
-		js.mu.Unlock()
+	} else if mset, _ := acc.lookupStream(sa.Config.Name); mset != nil {
+		// We have one here even though we are not a member. This can happen on re-assignment.
+		s.removeStream(ourID, mset, sa)
 	}
 
 	// If this stream assignment does not have a sync subject (bug) set that the meta-leader should check when elected.
@@ -2832,19 +2848,37 @@ func (js *jetStream) processUpdateStreamAssignment(sa *streamAssignment) {
 		js.processClusterUpdateStream(acc, osa, sa)
 	} else if mset, _ := acc.lookupStream(sa.Config.Name); mset != nil {
 		// We have one here even though we are not a member. This can happen on re-assignment.
-		s.Debugf("JetStream removing stream '%s > %s' from this server", sa.Client.serviceAccount(), sa.Config.Name)
-		if node := mset.raftNode(); node != nil {
-			if node.Leader() {
-				node.StepDown(sa.Group.Preferred)
-			}
-			node.ProposeRemovePeer(ourID)
-			// shut down monitor by shutting down raft
-			node.Delete()
-		}
-		// wait for monitor to be shut down
-		mset.monitorWg.Wait()
-		mset.stop(true, false)
+		s.removeStream(ourID, mset, sa)
 	}
+}
+
+// Common function to remove ourself from this server.
+// This can happen on re-assignment, move, etc
+func (s *Server) removeStream(ourID string, mset *stream, nsa *streamAssignment) {
+	if mset == nil {
+		return
+	}
+	// Make sure to use the new stream assignment, not our own.
+	s.Debugf("JetStream removing stream '%s > %s' from this server", nsa.Client.serviceAccount(), nsa.Config.Name)
+	if node := mset.raftNode(); node != nil {
+		if node.Leader() {
+			node.StepDown(nsa.Group.Preferred)
+		}
+		node.ProposeRemovePeer(ourID)
+		// shut down monitor by shutting down raft
+		node.Delete()
+	}
+
+	// Make sure this node is no longer attached to our stream assignment.
+	if js, _ := s.getJetStreamCluster(); js != nil {
+		js.mu.Lock()
+		nsa.Group.node = nil
+		js.mu.Unlock()
+	}
+
+	// wait for monitor to be shut down
+	mset.monitorWg.Wait()
+	mset.stop(true, false)
 }
 
 // processClusterUpdateStream is called when we have a stream assignment that
@@ -2993,10 +3027,49 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 		mset, err = acc.lookupStream(sa.Config.Name)
 		if err == nil && mset != nil {
 			osa := mset.streamAssignment()
+			// If we already have a stream assignment and they are the same exact config, short circuit here.
+			if osa != nil {
+				if reflect.DeepEqual(osa.Config, sa.Config) {
+					if sa.Group.Name == osa.Group.Name && reflect.DeepEqual(sa.Group.Peers, osa.Group.Peers) {
+						// Since this already exists we know it succeeded, just respond to this caller.
+						js.mu.RLock()
+						client, subject, reply := sa.Client, sa.Subject, sa.Reply
+						js.mu.RUnlock()
+
+						var resp = JSApiStreamCreateResponse{ApiResponse: ApiResponse{Type: JSApiStreamCreateResponseType}}
+						resp.StreamInfo = &StreamInfo{
+							Created: mset.createdTime(),
+							State:   mset.state(),
+							Config:  mset.config(),
+							Cluster: js.clusterInfo(mset.raftGroup()),
+							Sources: mset.sourcesInfo(),
+							Mirror:  mset.mirrorInfo(),
+						}
+						s.sendAPIResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
+						return
+					} else {
+						// We had a bug where we could have multiple assignments for the same
+						// stream but with different group assignments, including multiple raft
+						// groups. So check for that here. We can only bet on the last one being
+						// consistent in the long run, so let it continue if we see this condition.
+						s.Warnf("JetStream cluster detected duplicate assignment for stream %q for account %q", sa.Config.Name, acc.Name)
+						if osa.Group.node != nil && osa.Group.node != sa.Group.node {
+							osa.Group.node.Delete()
+							osa.Group.node = nil
+						}
+					}
+				}
+			}
 			mset.setStreamAssignment(sa)
 			if err = mset.updateWithAdvisory(sa.Config, false); err != nil {
 				s.Warnf("JetStream cluster error updating stream %q for account %q: %v", sa.Config.Name, acc.Name, err)
+				// Process the raft group and make sure it's running if needed.
+				js.createRaftGroup(acc.GetName(), osa.Group, storage)
 				mset.setStreamAssignment(osa)
+				if rg.node != nil {
+					rg.node.Delete()
+					rg.node = nil
+				}
 			}
 		} else if err == NewJSStreamNotFoundError() {
 			// Add in the stream here.
@@ -4575,41 +4648,25 @@ func (js *jetStream) processLeaderChange(isLeader bool) {
 
 // Lock should be held.
 func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePeer string) bool {
-	// Need to select a replacement peer
-	s, now, cluster := cc.s, time.Now(), sa.Client.Cluster
-	if sa.Config.Placement != nil && sa.Config.Placement.Cluster != _EMPTY_ {
-		cluster = sa.Config.Placement.Cluster
+	// Invoke placement algo passing RG peers that stay (existing) and the peer that is being removed (ignore)
+	var retain, ignore []string
+	for _, v := range sa.Group.Peers {
+		if v == removePeer {
+			ignore = append(ignore, v)
+		} else {
+			retain = append(retain, v)
+		}
 	}
-	ourID := cc.meta.ID()
 
-	for _, p := range cc.meta.Peers() {
-		// If it is not in our list it's probably shutdown, so don't consider.
-		if si, ok := s.nodeToInfo.Load(p.ID); !ok || si.(nodeInfo).offline {
-			continue
-		}
-		// Make sure they are active and current and not already part of our group.
-		current, lastSeen := p.Current, now.Sub(p.Last)
-		// We do not track activity of ourselves so ignore.
-		if p.ID == ourID {
-			lastSeen = 0
-		}
-		if !current || lastSeen > lostQuorumInterval || sa.Group.isMember(p.ID) {
-			continue
-		}
-		// Make sure the correct cluster.
-		if s.clusterNameForNode(p.ID) != cluster {
-			continue
-		}
-		// If we are here we have our candidate replacement, swap out the old one.
-		for i, peer := range sa.Group.Peers {
-			if peer == removePeer {
-				sa.Group.Peers[i] = p.ID
-				// Don't influence preferred leader.
-				sa.Group.Preferred = _EMPTY_
-				return true
-			}
-		}
+	newPeers, placementError := cc.selectPeerGroup(len(sa.Group.Peers), sa.Group.Cluster, sa.Config, retain, 0, ignore)
+
+	if placementError == nil {
+		sa.Group.Peers = newPeers
+		// Don't influence preferred leader.
+		sa.Group.Preferred = _EMPTY_
+		return true
 	}
+
 	// If we are here let's remove the peer at least.
 	for i, peer := range sa.Group.Peers {
 		if peer == removePeer {
@@ -4693,7 +4750,7 @@ func (e *selectPeerError) accumulate(eAdd *selectPeerError) {
 
 // selectPeerGroup will select a group of peers to start a raft group.
 // when peers exist already the unique tag prefix check for the replaceFirstExisting will be skipped
-func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamConfig, existing []string, replaceFirstExisting int) ([]string, *selectPeerError) {
+func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamConfig, existing []string, replaceFirstExisting int, ignore []string) ([]string, *selectPeerError) {
 	if cluster == _EMPTY_ || cfg == nil {
 		return nil, &selectPeerError{misc: true}
 	}
@@ -4769,6 +4826,15 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 		}
 	}
 
+	// Map ignore
+	var ip map[string]struct{}
+	if li := len(ignore); li > 0 {
+		ip = make(map[string]struct{})
+		for _, p := range ignore {
+			ip[p] = struct{}{}
+		}
+	}
+
 	maxHaAssets := s.getOpts().JetStreamLimits.MaxHAAssets
 
 	// An error is a result of multiple individual placement decisions.
@@ -4797,11 +4863,14 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 			continue
 		}
 
+		// If ignore skip
+		if _, ok := ip[p.ID]; ok {
+			continue
+		}
+
 		// If existing also skip, we will add back in to front of the list when done.
-		if ep != nil {
-			if _, ok := ep[p.ID]; ok {
-				continue
-			}
+		if _, ok := ep[p.ID]; ok {
+			continue
 		}
 
 		if ni.tags.Contains(jsExcludePlacement) {
@@ -4976,7 +5045,7 @@ func (js *jetStream) createGroupForStream(ci *ClientInfo, cfg *StreamConfig) (*r
 	// Need to create a group here.
 	errs := &selectPeerError{}
 	for _, cn := range clusters {
-		peers, err := cc.selectPeerGroup(replicas, cn, cfg, nil, 0)
+		peers, err := cc.selectPeerGroup(replicas, cn, cfg, nil, 0, nil)
 		if len(peers) < replicas {
 			errs.accumulate(err)
 			continue
@@ -5049,26 +5118,40 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
+	// Capture if we have existing assignment first.
+	osa := js.streamAssignment(acc.Name, cfg.Name)
+	var areEqual bool
+	if osa != nil {
+		areEqual = reflect.DeepEqual(osa.Config, cfg)
+	}
+
 	// If this stream already exists, turn this into a stream info call.
-	if sa := js.streamAssignment(acc.Name, cfg.Name); sa != nil {
+	if osa != nil {
 		// If they are the same then we will forward on as a stream info request.
 		// This now matches single server behavior.
-		if reflect.DeepEqual(sa.Config, cfg) {
-			isubj := fmt.Sprintf(JSApiStreamInfoT, cfg.Name)
-			// We want to make sure we send along the client info.
-			cij, _ := json.Marshal(ci)
-			hdr := map[string]string{
-				ClientInfoHdr:  string(cij),
-				JSResponseType: jsCreateResponse,
+		if areEqual {
+			// This works when we have a stream leader. If we have no leader let the dupe
+			// go through as normal. We will handle properly on the other end.
+			// We must check interest at the $SYS account layer, not user account since import
+			// will always show interest.
+			sisubj := fmt.Sprintf(clusterStreamInfoT, acc.Name, cfg.Name)
+			if s.SystemAccount().Interest(sisubj) > 0 {
+				isubj := fmt.Sprintf(JSApiStreamInfoT, cfg.Name)
+				// We want to make sure we send along the client info.
+				cij, _ := json.Marshal(ci)
+				hdr := map[string]string{
+					ClientInfoHdr:  string(cij),
+					JSResponseType: jsCreateResponse,
+				}
+				// Send this as system account, but include client info header.
+				s.sendInternalAccountMsgWithReply(nil, isubj, reply, hdr, nil, true)
+				return
 			}
-			// Send this as system account, but include client info header.
-			s.sendInternalAccountMsgWithReply(nil, isubj, reply, hdr, nil, true)
+		} else {
+			resp.Error = NewJSStreamNameExistError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 			return
 		}
-
-		resp.Error = NewJSStreamNameExistError()
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-		return
 	}
 
 	if cfg.Sealed {
@@ -5077,18 +5160,16 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 		return
 	}
 
+	var self *streamAssignment
+	if osa != nil && areEqual {
+		self = osa
+	}
+
 	// Check for subject collisions here.
-	asa := cc.streams[acc.Name]
-	for _, sa := range asa {
-		for _, subj := range sa.Config.Subjects {
-			for _, tsubj := range cfg.Subjects {
-				if SubjectsCollide(tsubj, subj) {
-					resp.Error = NewJSStreamSubjectOverlapError()
-					s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-					return
-				}
-			}
-		}
+	if cc.subjectsOverlap(acc.Name, cfg.Subjects, self) {
+		resp.Error = NewJSStreamSubjectOverlapError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+		return
 	}
 
 	apiErr = js.jsClusteredStreamLimitsCheck(acc, cfg)
@@ -5100,29 +5181,45 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 	}
 
 	// Raft group selection and placement.
-	rg, err := js.createGroupForStream(ci, cfg)
-	if err != nil {
-		resp.Error = NewJSClusterNoPeersError(err)
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-		return
+	var rg *raftGroup
+	if osa != nil && areEqual {
+		rg = osa.Group
+	} else {
+		// Check inflight before proposing in case we have an existing inflight proposal.
+		if cc.inflight == nil {
+			cc.inflight = make(map[string]map[string]*raftGroup)
+		}
+		streams, ok := cc.inflight[acc.Name]
+		if !ok {
+			streams = make(map[string]*raftGroup)
+			cc.inflight[acc.Name] = streams
+		} else if existing, ok := streams[cfg.Name]; ok {
+			// We have existing for same stream. Re-use same group.
+			rg = existing
+		}
 	}
-	// Pick a preferred leader.
-	rg.setPreferred()
+	// Create a new one here.
+	if rg == nil {
+		nrg, err := js.createGroupForStream(ci, cfg)
+		if err != nil {
+			resp.Error = NewJSClusterNoPeersError(err)
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+			return
+		}
+		rg = nrg
+		// Pick a preferred leader.
+		rg.setPreferred()
+	}
+
 	// Sync subject for post snapshot sync.
 	sa := &streamAssignment{Group: rg, Sync: syncSubjForStream(), Config: cfg, Subject: subject, Reply: reply, Client: ci, Created: time.Now().UTC()}
 	if err := cc.meta.Propose(encodeAddStreamAssignment(sa)); err == nil {
 		// On success, add this as an inflight proposal so we can apply limits
 		// on concurrent create requests while this stream assignment has
 		// possibly not been processed yet.
-		if cc.inflight == nil {
-			cc.inflight = make(map[string]map[string]struct{})
+		if streams, ok := cc.inflight[acc.Name]; ok {
+			streams[cfg.Name] = rg
 		}
-		streams, ok := cc.inflight[acc.Name]
-		if !ok {
-			streams = make(map[string]struct{})
-			cc.inflight[acc.Name] = streams
-		}
-		streams[cfg.Name] = struct{}{}
 	}
 }
 
@@ -5221,19 +5318,10 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	}
 
 	// Check for subject collisions here.
-	for _, sa := range cc.streams[acc.Name] {
-		if sa == osa {
-			continue
-		}
-		for _, subj := range sa.Config.Subjects {
-			for _, tsubj := range newCfg.Subjects {
-				if SubjectsCollide(tsubj, subj) {
-					resp.Error = NewJSStreamSubjectOverlapError()
-					s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-					return
-				}
-			}
-		}
+	if cc.subjectsOverlap(acc.Name, cfg.Subjects, osa) {
+		resp.Error = NewJSStreamSubjectOverlapError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+		return
 	}
 
 	// Make copy so to not change original.
@@ -5308,7 +5396,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	if isReplicaChange {
 		// We are adding new peers here.
 		if newCfg.Replicas > len(rg.Peers) {
-			peers, err := cc.selectPeerGroup(newCfg.Replicas, rg.Cluster, newCfg, rg.Peers, 0)
+			peers, err := cc.selectPeerGroup(newCfg.Replicas, rg.Cluster, newCfg, rg.Peers, 0, nil)
 			if err != nil {
 				resp.Error = NewJSClusterNoPeersError(err)
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))

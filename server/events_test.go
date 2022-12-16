@@ -473,11 +473,9 @@ func TestSystemAccountingWithLeafNodes(t *testing.T) {
 	}
 	seed, _ := kp.Seed()
 	mycreds := genCredsFile(t, ujwt, seed)
-	defer removeFile(t, mycreds)
 
 	// Create a server that solicits a leafnode connection.
-	sl, slopts, lnconf := runSolicitWithCredentials(t, opts, mycreds)
-	defer removeFile(t, lnconf)
+	sl, slopts, _ := runSolicitWithCredentials(t, opts, mycreds)
 	defer sl.Shutdown()
 
 	checkLeafNodeConnected(t, s)
@@ -1169,7 +1167,6 @@ func TestSystemAccountFromConfig(t *testing.T) {
     `
 
 	conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, opub, apub, ts.URL)))
-	defer removeFile(t, conf)
 
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
@@ -1268,7 +1265,7 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query SUBSZ for account
 	resp, err := ncSys.Request(subsz, nil, time.Second)
 	require_NoError(t, err)
-	require_Contains(t, string(resp.Data), `"num_subscriptions":4,`)
+	require_Contains(t, string(resp.Data), `"num_subscriptions":5,`)
 	// create a subscription
 	sub, err := nc.Subscribe("foo", func(msg *nats.Msg) {})
 	require_NoError(t, err)
@@ -1278,7 +1275,7 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query SUBSZ for account
 	resp, err = ncSys.Request(subsz, nil, time.Second)
 	require_NoError(t, err)
-	require_Contains(t, string(resp.Data), `"num_subscriptions":5,`, `"subject":"foo"`)
+	require_Contains(t, string(resp.Data), `"num_subscriptions":6,`, `"subject":"foo"`)
 	// query connections for account
 	resp, err = ncSys.Request(connz, nil, time.Second)
 	require_NoError(t, err)
@@ -1418,7 +1415,7 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unmarshalling failed: %v", err)
 	} else if len(info.Exports) != 1 {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if len(info.Imports) != 3 {
+	} else if len(info.Imports) != 4 {
 		t.Fatalf("Unexpected value: %+v", info.Imports)
 	} else if info.Exports[0].Subject != "req.*" {
 		t.Fatalf("Unexpected value: %v", info.Exports)
@@ -1426,7 +1423,7 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unexpected value: %v", info.Exports)
 	} else if info.Exports[0].ResponseType != jwt.ResponseTypeSingleton {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if info.SubCnt != 3 {
+	} else if info.SubCnt != 4 {
 		t.Fatalf("Unexpected value: %v", info.SubCnt)
 	} else {
 		checkCommon(&info, &srv, pub1, ajwt1)
@@ -1439,7 +1436,7 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unmarshalling failed: %v", err)
 	} else if len(info.Exports) != 0 {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if len(info.Imports) != 4 {
+	} else if len(info.Imports) != 5 {
 		t.Fatalf("Unexpected value: %+v", info.Imports)
 	}
 	// Here we need to find our import
@@ -1457,7 +1454,7 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unexpected value: %+v", si)
 	} else if si.Account != pub1 {
 		t.Fatalf("Unexpected value: %+v", si)
-	} else if info.SubCnt != 4 {
+	} else if info.SubCnt != 5 {
 		t.Fatalf("Unexpected value: %+v", si)
 	} else {
 		checkCommon(&info, &srv, pub2, ajwt2)
@@ -1664,7 +1661,7 @@ func TestSystemAccountWithGateways(t *testing.T) {
 
 	// If this tests fails with wrong number after 10 seconds we may have
 	// added a new inititial subscription for the eventing system.
-	checkExpectedSubs(t, 45, sa)
+	checkExpectedSubs(t, 50, sa)
 
 	// Create a client on B and see if we receive the event
 	urlb := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
@@ -1790,7 +1787,6 @@ func TestServerAccountConns(t *testing.T) {
 			   SYS: {users: [{user: s, password: s}]}
 			   ACC: {users: [{user: a, password: a}]}
 	   }`))
-	defer removeFile(t, conf)
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -2178,7 +2174,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 		{"JSZ", nil, &JSzOptions{}, []string{"now", "disabled"}},
 
 		{"HEALTHZ", nil, &JSzOptions{}, []string{"status"}},
-		{"HEALTHZ", &HealthzOptions{JSEnabled: true}, &JSzOptions{}, []string{"status"}},
+		{"HEALTHZ", &HealthzOptions{JSEnabledOnly: true}, &JSzOptions{}, []string{"status"}},
 		{"HEALTHZ", &HealthzOptions{JSServerOnly: true}, &JSzOptions{}, []string{"status"}},
 	}
 
@@ -2412,7 +2408,6 @@ func TestServerEventsFilteredByTag(t *testing.T) {
 		}
 		no_auth_user: b
     `))
-	defer removeFile(t, confA)
 	sA, _ := RunServerWithConfig(confA)
 	defer sA.Shutdown()
 	confB := createConfFile(t, []byte(fmt.Sprintf(`
@@ -2437,7 +2432,6 @@ func TestServerEventsFilteredByTag(t *testing.T) {
 		}
 		no_auth_user: b
     `, sA.opts.Cluster.Port)))
-	defer removeFile(t, confB)
 	sB, _ := RunServerWithConfig(confB)
 	defer sB.Shutdown()
 	checkClusterFormed(t, sA, sB)

@@ -2250,15 +2250,15 @@ func TestServerIDs(t *testing.T) {
 
 	for mode := 0; mode < 2; mode++ {
 		v := pollVarz(t, s, mode, murl+"varz", nil)
-		if v.ID == "" {
+		if v.ID == _EMPTY_ {
 			t.Fatal("Varz ID is empty")
 		}
 		c := pollConz(t, s, mode, murl+"connz", nil)
-		if c.ID == "" {
+		if c.ID == _EMPTY_ {
 			t.Fatal("Connz ID is empty")
 		}
 		r := pollRoutez(t, s, mode, murl+"routez", nil)
-		if r.ID == "" {
+		if r.ID == _EMPTY_ {
 			t.Fatal("Routez ID is empty")
 		}
 		if v.ID != c.ID || v.ID != r.ID {
@@ -2632,7 +2632,6 @@ func TestMonitorClusterURLs(t *testing.T) {
 		}
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(template, "nats://"+s2ClusterHostPort, "")))
-	defer removeFile(t, conf)
 	s1, _ := RunServerWithConfig(conf)
 	defer s1.Shutdown()
 
@@ -3249,7 +3248,6 @@ func TestMonitorGatewayzAccounts(t *testing.T) {
 		}
 		no_sys_acc = true
 	`, accounts)))
-	defer removeFile(t, bConf)
 
 	sb, ob := RunServerWithConfig(bConf)
 	defer sb.Shutdown()
@@ -3274,7 +3272,6 @@ func TestMonitorGatewayzAccounts(t *testing.T) {
 		}
 		no_sys_acc = true
 	`, accounts, sb.GatewayAddr().Port)))
-	defer removeFile(t, aConf)
 
 	sa, oa := RunServerWithConfig(aConf)
 	defer sa.Shutdown()
@@ -3651,7 +3648,6 @@ func TestMonitorOpJWT(t *testing.T) {
 	resolver = MEMORY
 	`
 	conf := createConfFile(t, []byte(content))
-	defer removeFile(t, conf)
 	sa, _ := RunServerWithConfig(conf)
 	defer sa.Shutdown()
 
@@ -3692,7 +3688,6 @@ func TestMonitorLeafz(t *testing.T) {
 	}
 	`
 	conf := createConfFile(t, []byte(content))
-	defer removeFile(t, conf)
 	sb, ob := RunServerWithConfig(conf)
 	defer sb.Shutdown()
 
@@ -3711,9 +3706,7 @@ func TestMonitorLeafz(t *testing.T) {
 		return acc, creds
 	}
 	acc1, mycreds1 := createAcc(t)
-	defer removeFile(t, mycreds1)
 	acc2, mycreds2 := createAcc(t)
-	defer removeFile(t, mycreds2)
 
 	content = `
 		port: -1
@@ -3751,7 +3744,6 @@ func TestMonitorLeafz(t *testing.T) {
 		acc1.Name, ob.LeafNode.Port, mycreds1,
 		acc2.Name, ob.LeafNode.Port, mycreds2)
 	conf = createConfFile(t, []byte(config))
-	defer removeFile(t, conf)
 	sa, oa := RunServerWithConfig(conf)
 	defer sa.Shutdown()
 
@@ -3914,8 +3906,8 @@ func TestMonitorLeafz(t *testing.T) {
 				t.Fatalf("RTT not tracked?")
 			}
 			// LDS should be only one.
-			if ln.NumSubs != 4 || len(ln.Subs) != 4 {
-				t.Fatalf("Expected 3 subs, got %v (%v)", ln.NumSubs, ln.Subs)
+			if ln.NumSubs != 5 || len(ln.Subs) != 5 {
+				t.Fatalf("Expected 5 subs, got %v (%v)", ln.NumSubs, ln.Subs)
 			}
 		}
 	}
@@ -3933,7 +3925,7 @@ func TestMonitorAccountz(t *testing.T) {
 	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?acc=$SYS", s.MonitorAddr().Port, AccountzPath)))
 	require_Contains(t, body, `"account_detail": {`)
 	require_Contains(t, body, `"account_name": "$SYS",`)
-	require_Contains(t, body, `"subscriptions": 40,`)
+	require_Contains(t, body, `"subscriptions": 44,`)
 	require_Contains(t, body, `"is_system": true,`)
 	require_Contains(t, body, `"system_account": "$SYS"`)
 
@@ -4092,8 +4084,7 @@ func TestMonitorJsz(t *testing.T) {
 		{7500, 7501, 7502, 5502},
 		{5500, 5501, 5502, 7502},
 	} {
-		tmpDir := createDir(t, fmt.Sprintf("srv_%d", test.port))
-		defer removeDir(t, tmpDir)
+		tmpDir := t.TempDir()
 		cf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:%d
 		http: 127.0.0.1:%d
@@ -4125,7 +4116,6 @@ func TestMonitorJsz(t *testing.T) {
 		}
 		server_name: server_%d
 		server_tags: [ "az:%d" ] `, test.port, test.mport, tmpDir, test.cport, test.routed, test.port, test.port)))
-		defer removeFile(t, cf)
 
 		s, _ := RunServerWithConfig(cf)
 		defer s.Shutdown()
@@ -4422,7 +4412,6 @@ func TestMonitorReloadTLSConfig(t *testing.T) {
 	conf := createConfFile(t, []byte(fmt.Sprintf(template,
 		"../test/configs/certs/server-noip.pem",
 		"../test/configs/certs/server-key-noip.pem")))
-	defer removeFile(t, conf)
 
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
@@ -4568,4 +4557,31 @@ func TestMonitorWebsocket(t *testing.T) {
 			t.Fatalf("Expected\n%+v\nGot:\n%+v", expected, vw)
 		}
 	}
+}
+
+func TestServerIDZRequest(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		server_name: TEST22
+		# For access to system account.
+		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+	`))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+
+	subject := fmt.Sprintf(serverPingReqSubj, "IDZ")
+	resp, err := nc.Request(subject, nil, time.Second)
+	require_NoError(t, err)
+
+	var sid ServerID
+	err = json.Unmarshal(resp.Data, &sid)
+	require_NoError(t, err)
+
+	require_True(t, sid.Name == "TEST22")
+	require_True(t, strings.HasPrefix(sid.ID, "N"))
 }

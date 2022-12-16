@@ -1096,7 +1096,7 @@ func TestRouteNoCrashOnAddingSubToRoute(t *testing.T) {
 
 	// Make sure all subs are registered in s.
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
-		if ts := s.globalAccount().TotalSubs() - 4; ts != int(numRoutes) {
+		if ts := s.globalAccount().TotalSubs() - 4; ts < int(numRoutes) {
 			return fmt.Errorf("Not all %d routed subs were registered: %d", numRoutes, ts)
 		}
 		return nil
@@ -1449,8 +1449,7 @@ func TestTLSRoutesCertificateImplicitAllowFail(t *testing.T) {
 
 func testTLSRoutesCertificateImplicitAllow(t *testing.T, pass bool) {
 	// Base config for the servers
-	cfg := createFile(t, "cfg")
-	defer removeFile(t, cfg.Name())
+	cfg := createTempFile(t, "cfg")
 	cfg.WriteString(fmt.Sprintf(`
 		cluster {
 		  tls {
@@ -1684,7 +1683,6 @@ func TestRouteSaveTLSName(t *testing.T) {
 			}
 		}
 	`))
-	defer removeFile(t, c1Conf)
 	s1, o1 := RunServerWithConfig(c1Conf)
 	defer s1.Shutdown()
 
@@ -1702,7 +1700,6 @@ func TestRouteSaveTLSName(t *testing.T) {
 	}
 	`
 	c2And3Conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "localhost", o1.Cluster.Port)))
-	defer removeFile(t, c2And3Conf)
 	s2, _ := RunServerWithConfig(c2And3Conf)
 	defer s2.Shutdown()
 
