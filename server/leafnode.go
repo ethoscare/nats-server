@@ -1621,6 +1621,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 			c.Debugf("Not permitted to import service %q on behalf of %s%s", isubj, accName, accNTag)
 			continue
 		}
+		fmt.Println("IMPORT: ", isubj)
 		ims = append(ims, isubj)
 	}
 	// Likewise for mappings.
@@ -1634,11 +1635,47 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 
 	// Create a unique subject that will be used for loop detection.
 	lds := acc.lds
+	var cleanupSID []byte
+	// var ic *client
 	if lds == _EMPTY_ {
 		lds = leafNodeLoopDetectionSubjectPrefix + nuid.Next()
 		acc.lds = lds
+		fmt.Println("--- Binding to leafnode", acc.lds)
+		if len(acc.siReply) > 0 {
+			cleanupWC := string(append(acc.siReply, '>'))
+
+			if r := acc.sl.Match(cleanupWC); len(r.psubs) > 0 {
+				fmt.Println("--- Removing wildcard interest from leafnode", acc.lds, cleanupWC, len(r.psubs))
+				cleanupSID = r.psubs[0].sid
+				// ic = acc.internalClient()
+				for _, e := range acc.exports.responses {
+					fmt.Printf("RESPONSE PENDING: %+v", e)
+				}
+				// for _, sub := range r.psubs {
+				// 	fmt.Println("SID: ", sub.sid)
+				// 	acc.internalClient().processUnsub(sub.sid)
+				// }
+			}
+		}
+
+		// if replyPre := acc.siReply; string(replyPre) != _EMPTY_ {
 	}
 	acc.mu.Unlock()
+
+	if len(cleanupSID) > 0 {
+		// FIXME: Any inflight request that could have been responded on the local cluster
+		// wil not be able to route back when we unsub the WC, if the responder is on the
+		// other side of the leafnode there is no impact.
+		// fmt.Println("cleaning up ", string(cleanupSID))
+		// ic.processUnsub(cleanupSID)
+	}
+	// if cleanupWC != _EMPTY_ {
+	// 	fmt.Println("--- Removing wildcard interest from leafnode", acc.lds, cleanupWC)
+	// 	// Remove service import
+	// 	acc.removeServiceImport(cleanupWC)
+	// 	// unsubscribe
+	// 	//  acc.subscribeServiceImportResponse(string(append(replyPre, '>')))
+	// }
 
 	// Now check for gateway interest. Leafnodes will put this into
 	// the proper mode to propagate, but they are not held in the account.

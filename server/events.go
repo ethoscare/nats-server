@@ -818,6 +818,7 @@ func getHashSize(name string, size int) string {
 	}
 	h := compute()
 	m.Store(name, h)
+	fmt.Println("HASH: ", name, h)
 	return h
 }
 

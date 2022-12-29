@@ -1654,6 +1654,7 @@ func (a *Account) removeRespServiceImport(si *serviceImport, reason rsiReason) {
 
 	a.mu.Lock()
 	c := a.ic
+	// TODO: resub
 	delete(a.exports.responses, si.from)
 	dest, to, tracking, rc, didDeliver := si.acc, si.to, si.tracking, si.rc, si.didDeliver
 	a.mu.Unlock()
@@ -2191,12 +2192,14 @@ func (a *Account) newServiceReply(tracking bool) []byte {
 		a.createRespWildcard()
 		createdSiReply = true
 	}
-	replyPre, isBoundToLeafnode := a.siReply, a.lds != _EMPTY_
+	replyPre, isBoundToLeafnode := a.siReply, a.lds != _EMPTY_ // TODO: Check when lds exists in accounts.go
 	a.mu.Unlock()
 
 	// If we created the siReply and we are not bound to a leafnode
 	// we need to do the wildcard subscription.
-	if createdSiReply && !isBoundToLeafnode {
+	// if createdSiReply && !isBoundToLeafnode {
+	if createdSiReply {
+		fmt.Println("subscribing to service import response: ", string(append(replyPre, '>')), isBoundToLeafnode)
 		a.subscribeServiceImportResponse(string(append(replyPre, '>')))
 	}
 
@@ -2356,7 +2359,7 @@ func (a *Account) addRespServiceImport(dest *Account, to string, osi *serviceImp
 		si.tracking = true
 		si.trackingHdr = header
 	}
-	isBoundToLeafnode := a.lds != _EMPTY_
+	// isBoundToLeafnode := a.lds != _EMPTY_
 	a.mu.Unlock()
 
 	// We might not do individual subscriptions here like we do on configured imports.
@@ -2364,10 +2367,10 @@ func (a *Account) addRespServiceImport(dest *Account, to string, osi *serviceImp
 	// We have an internal callback for all responses inbound to this account and
 	// will process appropriately there. This does not pollute the sublist and the caches.
 
-	if isBoundToLeafnode {
-		sub, _ := a.subscribeServiceImportResponse(nrr)
-		si.sid = sub.sid
-	}
+	// if isBoundToLeafnode {
+	// 	sub, _ := a.subscribeServiceImportResponse(nrr)
+	// 	si.sid = sub.sid
+	// }
 
 	// We do add in the reverse map such that we can detect loss of interest and do proper
 	// cleanup of this si as interest goes away.

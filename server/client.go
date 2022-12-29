@@ -2562,6 +2562,9 @@ func (c *client) processSubEx(subject, queue, bsid []byte, cb msgHandler, noForw
 				// In order to avoid duplicate responses due to for example both '_R_.foo.>' and '_R_.foo.bar'
 				// being registered, we suppress adding an extra subscription here.
 				if r := acc.sl.Match(string(sub.subject)); r != nil && (len(r.psubs) > 0) {
+					fmt.Println("SUPRESSED!!!!!!!!!!!!!!!!!", acc.Name, string(sub.subject))
+					fmt.Printf("--> %+v\n", r.psubs[0])
+					fmt.Printf("--> SUB: %s\n", r.psubs[0].subject)
 					delete(c.subs, sid)
 					c.mu.Unlock()
 					return sub, nil

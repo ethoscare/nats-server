@@ -5029,7 +5029,7 @@ func TestNoRaceJetStreamPullConsumersAndInteriorDeletes(t *testing.T) {
 	case <-ch:
 		// OK
 	case <-time.After(20 * time.Second):
-		t.Fatalf("Consumers took too long to consumer all messages")
+		t.Fatalf("Consumers took too long to consume all messages")
 	}
 }
 
