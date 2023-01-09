@@ -3,214 +3,156 @@ package server
 import (
 	"fmt"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 )
 
-func startStore(t *testing.T, cloudPort int, cloudUser string) (*Server, string) {
-	u, err := url.Parse(fmt.Sprintf("nats-leaf://%s:s3cr3t@localhost:%d", cloudUser, cloudPort))
+func startCloud(t *testing.T, serverConfig []byte, cloudPort int) (*Server, string) {
+	configStr := fmt.Sprintf(string(serverConfig), strconv.Itoa(cloudPort))
+	cloudConfig := createConfFile(t, []byte(configStr))
+	cloudServer, _ := RunServerWithConfig(cloudConfig)
+	return cloudServer, cloudConfig
+}
+
+func startStore(t *testing.T, serverConfig []byte, hubPort int, hubUser string, storeId string, storePort int) (*Server, string) {
+	u, err := url.Parse(fmt.Sprintf("nats-leaf://%s:s3cr3t@localhost:%d", hubUser, hubPort))
 	if err != nil {
 		t.Fatalf("Error parsing url: %v", err)
 	}
-
-	configStr := fmt.Sprintf(string([]byte(`
-		port: -1
-		leaf {
-			remotes [
-				{ url: "%s", account: "STORE" }
-			]
-		}
-
-		accounts: {
-			# Aggregation point for messages crossing Cloud-Store membrane
-			# Bound to STORE-X in Hub
-			STORE: {
-				users: [ { user: "user-cloud", password: "s3cr3t" } ]
-				exports: [
-					{
-						stream: "store.*.>"
-						accounts: [
-							"APP-1"
-							"APP-2"
-							"APP-3"
-						]
-					}
-				]
-				imports: [
-					{ stream: { account: "APP-1", subject: "store.*.>" }, prefix: "bus.APP-1" }
-					{ stream: { account: "APP-2", subject: "store.*.>" }, prefix: "bus.APP-2" }
-					{ stream: { account: "APP-3", subject: "store.*.>" }, prefix: "bus.APP-3" }
-				]
-			}
-			# APP-X is a store account for Application X in store
-			APP-1: {
-				users: [ { user: "user-app-1", password: "s3cr3t" } ]
-				# Share Application X publishes with cloud (via STORE) and other store Applications
-				exports: [
-					{
-						stream: "store.*.>"
-						accounts: [
-							"STORE"
-							"APP-1"
-							"APP-2"
-							"APP-3"
-						]
-					}
-				]
-				imports: [
-					# Ability to subscribe messages published by other store Applications and from cloud Applications
-					{ stream: { account: "STORE", subject: "store.*.>" }, prefix: "bus.CLOUD" }
-					{ stream: { account: "APP-1", subject: "store.*.>" }, prefix: "bus.APP-1" }
-					{ stream: { account: "APP-2", subject: "store.*.>" }, prefix: "bus.APP-2" }
-					{ stream: { account: "APP-3", subject: "store.*.>" }, prefix: "bus.APP-3" }
-				]
-			}
-			APP-2: {
-				users: [ { user: "user-app-2", password: "s3cr3t" } ]
-				exports: [
-					{
-						stream: "store.*.>"
-						accounts: [
-							"STORE"
-							"APP-1"
-							"APP-2"
-							"APP-3"
-						]
-					}
-				]
-				imports: [
-					{ stream: { account: "STORE", subject: "store.*.>" }, prefix: "bus.CLOUD" }
-					{ stream: { account: "APP-1", subject: "store.*.>" }, prefix: "bus.APP-1" }
-					{ stream: { account: "APP-2", subject: "store.*.>" }, prefix: "bus.APP-2" }
-					{ stream: { account: "APP-3", subject: "store.*.>" }, prefix: "bus.APP-3" }
-				]
-			}
-			APP-3: {
-				users: [ { user: "user-app-3", password: "s3cr3t" } ]
-				exports: [
-					{
-						stream: "store.*.>"
-						accounts: [
-							"STORE"
-							"APP-1"
-							"APP-2"
-							"APP-3"
-						]
-					}
-				]
-				imports: [
-					{ stream: { account: "STORE", subject: "store.*.>" }, prefix: "bus.CLOUD" }
-					{ stream: { account: "APP-1", subject: "store.*.>" }, prefix: "bus.APP-1" }
-					{ stream: { account: "APP-2", subject: "store.*.>" }, prefix: "bus.APP-2" }
-					{ stream: { account: "APP-3", subject: "store.*.>" }, prefix: "bus.APP-3" }
-				]
-			}
-			SYS: {
-				users: [ { user: "system", password: "s3cr3t" } ]
-			}
-		}
-		system_account: "SYS"
-	`)), u.String())
-
+	configStr := fmt.Sprintf(string(serverConfig), u.String(), storeId, strconv.Itoa(storePort))
 	storeConfig := createConfFile(t, []byte(configStr))
 	storeServer, _ := RunServerWithConfig(storeConfig)
-
-	// A little settle time
 	time.Sleep(1 * time.Second)
 	checkLeafNodeConnectedCount(t, storeServer, 1)
-
 	return storeServer, storeConfig
 }
 
-// TestE2ESolution1 tests the topology of a hub with multiple leafs (cloud with multiple edges):
-//
-// 1. Cloud (hub) and all stores (leaves) are multi-account enabled
-// 2. An account in cloud acts as a down-filtering/traffic direction for individual stores
-// 3. Each store is identically configured, with exception of cloud credential
-// 4. Cloud and all stores can publish on a common "store" subject hierarchy. Cloud sees as "retail" subject hierarchy
-// 5. Cloud can subscribe to all messages (both published in cloud and in the stores) of the common subject hierarchy
-// 6. Stores can subscribe to all messages published locally in their store on the common subject hierarchy
-// 7. A store can subscribe to subject hierarchy messages (published by cloud) intended for that store only
-// 8. Specific accounts of the cloud and stores may be further filtered by a classification subject token
-//
-// Cloud publishes as:
-// retail.{class}.{store number}.>
-// A store subscribes as:
-// bus.{app code}.store.{class}.>
-//
-// A store publishes as:
-// store.{class}.>
-// Cloud subscribes as as:
-// bus.{app code}.retail.{class}.{store number}.>
+func TestE2ERetailSolutionRetailFleetBus(t *testing.T) {
+	/*
+			E2E configuration for a retail cloud application accounts interacting bi-directionally with a fleet of
+			retail stores.  Each retail store has multiple store application accounts.  Tests the topology of a hub with
+			multiple leafs (cloud with multiple edges) where the leafs are inherently "untrusted" by the hub (i.e. hub-resident
+			controls must protect against "rogue" stores).
 
-func TestE2ERetailSolution1(t *testing.T) {
+			Store NATS configuration has a unique RETAIL cloud credential (with suitable permissions).
+		    Store NATS configuration needs to know the store id of its instance.
+			Store NATS configuration imports messages from each store app by unique app name.
+			Store does not need to know cloud app names.
+			Store apps have a unique app name.
+			Store apps do not need to know the store id they are executing in.
 
-	// TODO: messages published in store not traversing back to cloud-app-1 subscription to bus.>
+			Cloud NATS configuration imports messages from each cloud app by unique app name.
+			Cloud apps have a unique app name.
+			Cloud does not need to know store app names.
 
-	cloudConfig := createConfFile(t, []byte(`
-		port: -1
+			A cloud app publishes as: bus.retail.{app name}.{class}.{store id}.>
+				bus.retail.{app name}.{class}.2.> to publish messages that will be received by store id 2 only
+				bus.retail.{app name}.{class}.ALL.> to publish messages that will be received by all stores
+				bus.retail.{app name}.{class}.NONE.> to publish messages that will be received by no stores (only cloud apps)
+
+			A cloud app subscribes as: bus.retail.{app name}.{class}.{store id}.>
+				bus.retail.> to see all publishes from both cloud and store
+				bus.retail.CLOUD-APP-2.> to see all publishes from cloud app CLOUD-APP-2 only
+				bus.retail.STORE.> to see all publishes from stores only
+				bus.retail.STORE.*.2.> to see publishes just from store id 2)
+
+			A store app publishes as: bus.store.{app name}.{class}.>
+
+			A store app subscribes as: bus.store.{app name}.{class}.>
+				bus.store.> to see all publishes from apps in the same store and cloud app publishes shared with the store
+				bus.store.APP-3.> to see all publishes from a specific store app in the same store
+				bus.store.CLOUD.> to see all publishes just from cloud apps
+
+			Cloud apps and store apps can be configured to receive only specific classes (e.g. data classificaiton) of messages
+			through specific import specification.  See store app APP-2 import below where only C4 messages from cloud apps
+			and other same-store apps will be seen by APP-2.
+	*/
+	cloudConfig := []byte(`
+		port: %[1]s
 		leafnodes: {
 			listen: "127.0.0.1:-1"
 		}
-
+	
 		accounts: {
-			# Account representating aggregate stores
 			RETAIL: {
-				users: [ { user: "user-retail", password: "s3cr3t" } ]
+				users: [ 
+					{
+						user: "user-retail-admin", password: "s3cr3t"
+					}
+					{ 
+						user: "user-store-1", password: "s3cr3t"
+						permissions: {
+							# Solicitor-side (leaf-side is the solicitor, hub-side is the solicited) sees reversed publish/subscribe perms
+
+							# Uplink
+							# Subscription for bus.retail.STORE.*.1.> passed to Leaf
+							# Leaf may publish bus.retail.STORE.*.1.> to Hub
+							# Subscription for bus.store.> is passed to the Hub
+							# Any rogue bus.store.> publishes to hub not exported from RETAIL
+
+							publish: [ "bus.store.>", "bus.retail.STORE.*.1.>" ]
+
+							# Downlink
+							# Subscription for bus.store.CLOUD.*.1.> and bus.store.CLOUD.*.ALL.> passed to Hub
+							# Hub may publish bus.store.CLOUD.*.1.> and bus.store.CLOUD.*.ALL.> to Leaf
+							# Subscription for bus.retail.> passed to Leaf
+							# Any rogue bus.retail.> subscribes from hub not exported to RETAIL
+
+							subscribe: [ "bus.retail.>", "bus.store.CLOUD.*.1.>", "bus.store.CLOUD.*.ALL.>" ]
+						}
+					}
+					{ 
+						user: "user-store-2", password: "s3cr3t"
+						permissions: {
+							publish: [ "bus.store.>", "bus.retail.STORE.*.2.>" ]
+							subscribe: [ "bus.retail.>", "bus.store.CLOUD.*.2.>", "bus.store.CLOUD.*.ALL.>" ]
+						}
+					}
+				]
 				exports: [
-					# Publish point for all retail stores
-					{ service: "retail.*.*.>" }
-
-					# Share aggragate publishes from stores with other cloud accounts
-					{ service: "bus.*.retail.*.*.>" }
-					{ stream: "bus.*.retail.*.*.>" }
-
-					# Messages published in cloud (to retail) down to specific store
-					{ stream: "retail.*.1.>", accounts: [ "STORE-1" ] }
-					{ stream: "retail.*.2.>", accounts: [ "STORE-2" ] }
-
-					# Echo to self to allow bus.CLOUD
-					{ stream: "retail.*.*.>", accounts: [ "RETAIL" ] }
+					# uplink
+					{ stream: "bus.retail.STORE.*.*.>" }
 				]
 				imports: [
-					# If this is implemented, we get a cycle error combined with CLOUD-APP-1 export/import
-					# { stream: { account: "RETAIL", subject: "retail.*.*.>" }, prefix: "bus.CLOUD" } 
-				]
-			}
-			# STORE-X in Hub (bound to STORE at each Leaf)
-			STORE-1: {
-				users: [ { user: "user-store-1", password: "s3cr3t" } ]
-				imports: [
-					# Publish into RETAIL
-					# Flip "store" token to "retail" token
-					# Add store number
-					# Store 1 can only publish as Store 1
-					# ** These are direct publishes in RETAIL account at hub **
-
-					{ service: { account: "RETAIL", subject: "bus.*.retail.*.1.>" }, to: "bus.*.store.*.>" }
-					
-					# Subscribe from RETAIL
-					# Flip "retail" token to "store" token
-					# Remove store number
-					# Store 1 can only subscribe to Store 1 addressed messages
-					# ** These will be experienced as direct _publishes_ in STORE account at leaf **
-
-					{ stream: { account: "RETAIL", subject: "retail.*.1.>" }, to: "store.*.>" }
-				]
-			}
-			STORE-2: {
-				users: [ { user: "user-store-2", password: "s3cr3t" } ]
-				imports: [
-					{ service: { account: "RETAIL", subject: "bus.*.retail.*.2.>" }, to: "bus.*.store.*.>" }
-					{ stream: { account: "RETAIL", subject: "retail.*.2.>" }, to: "store.*.>" }
+					# downlink
+					{ stream: { account: "CLOUD-APP-1", subject: "bus.retail.CLOUD-APP-1.*.*.>" }, to: "bus.store.CLOUD.*.*.>" }
+					{ stream: { account: "CLOUD-APP-2", subject: "bus.retail.CLOUD-APP-2.*.*.>" }, to: "bus.store.CLOUD.*.*.>" }
+					{ stream: { account: "CLOUD-APP-3", subject: "bus.retail.CLOUD-APP-3.*.*.>" }, to: "bus.store.CLOUD.*.*.>" }
 				]
 			}
 			CLOUD-APP-1: {
 				users: [ { user: "user-cloud-app-1", password: "s3cr3t" } ]
+				exports: [
+					{ stream: "bus.retail.CLOUD-APP-1.*.*.>" }
+				]
 				imports: [
-					{ service: { account: "RETAIL", subject: "retail.*.*.>" } }
-					# This should see store-origin messages, but not cloud-origin including my own...
-					{ stream: { account: "RETAIL", subject: "bus.*.retail.*.*.>" } }
+					{ stream: { account: "RETAIL", subject: "bus.retail.STORE.*.*.>" } }
+					{ stream: { account: "CLOUD-APP-2", subject: "bus.retail.CLOUD-APP-2.*.*.>" } }
+					{ stream: { account: "CLOUD-APP-3", subject: "bus.retail.CLOUD-APP-3.*.*.>" } }
+				]
+			}
+			CLOUD-APP-2: {
+				users: [ { user: "user-cloud-app-2", password: "s3cr3t" } ]
+				exports: [
+					{ stream: "bus.retail.CLOUD-APP-2.*.*.>" }
+				]
+				# CLOUD-APP-2 only receives Classification 4 messages
+				imports: [
+					{ stream: { account: "RETAIL", subject: "bus.retail.STORE.C4.*.>" } }
+					{ stream: { account: "CLOUD-APP-1", subject: "bus.retail.CLOUD-APP-1.C4.*.>" } }
+					{ stream: { account: "CLOUD-APP-3", subject: "bus.retail.CLOUD-APP-3.C4.*.>" } }
+				]
+			}
+			CLOUD-APP-3: {
+				users: [ { user: "user-cloud-app-3", password: "s3cr3t" } ]
+				exports: [
+					{ stream: "bus.retail.CLOUD-APP-3.*.*.>" }
+				]
+				imports: [
+					{ stream: { account: "RETAIL", subject: "bus.retail.STORE.*.*.>" } }
+					{ stream: { account: "CLOUD-APP-1", subject: "bus.retail.CLOUD-APP-1.*.*.>" } }
+					{ stream: { account: "CLOUD-APP-2", subject: "bus.retail.CLOUD-APP-2.*.*.>" } }
 				]
 			}
 			SYS: {
@@ -218,40 +160,147 @@ func TestE2ERetailSolution1(t *testing.T) {
 			}
 		}
 		system_account: "SYS"
-	`))
-	defer removeFile(t, cloudConfig)
-	cloud, _ := RunServerWithConfig(cloudConfig)
+	`)
+
+	storeConfig := []byte(`
+		port: %[3]s
+		leaf {
+			# RETAIL (hub) <-> STORE (leaf)
+			remotes [
+				{ url: "%[1]s", account: "STORE" }
+			]
+		}
+
+		accounts: {
+			STORE: {
+				users: [ { user: "user-store-admin", password: "s3cr3t" } ]
+				exports: [
+					# downlink
+					{ stream: "bus.store.CLOUD.*.%[2]s.>" }
+					{ stream: "bus.store.CLOUD.*.ALL.>" }
+				]
+				imports: [
+					# uplink
+					{ stream: { account: "APP-1", subject: "bus.store.APP-1.*.>"}, to: "bus.retail.STORE.*.%[2]s.>" }
+					{ stream: { account: "APP-2", subject: "bus.store.APP-2.*.>"}, to: "bus.retail.STORE.*.%[2]s.>" }
+					{ stream: { account: "APP-3", subject: "bus.store.APP-3.*.>"}, to: "bus.retail.STORE.*.%[2]s.>" }
+				]
+			}
+			APP-1: {
+				users: [ { user: "user-app-1", password: "s3cr3t" } ]
+				exports: [
+					{ stream: "bus.store.APP-1.*.>" }
+				]
+				imports: [
+					{ stream: { account: "STORE", subject: "bus.store.CLOUD.*.%[2]s.>" }, to: "bus.store.CLOUD.*.>" }
+					{ stream: { account: "STORE", subject: "bus.store.CLOUD.*.ALL.>" }, to: "bus.store.CLOUD.*.>" }
+					{ stream: { account: "APP-2", subject: "bus.store.APP-2.*.>" } }
+					{ stream: { account: "APP-3", subject: "bus.store.APP-3.*.>" } }
+				]
+			}
+			APP-2: {
+				users: [ { user: "user-app-2", password: "s3cr3t" } ]
+				exports: [
+					{ stream: "bus.store.APP-2.*.>" }
+				]
+				imports: [
+					# APP-2 in store only allowed to receive Classification 4 messages
+					{ stream: { account: "STORE", subject: "bus.store.CLOUD.C4.%[2]s.>" }, to: "bus.store.CLOUD.C4.>" }
+					{ stream: { account: "STORE", subject: "bus.store.CLOUD.C4.ALL.>" }, to: "bus.store.CLOUD.C4.>" }
+					{ stream: { account: "APP-1", subject: "bus.store.APP-1.C4.>" } }
+					{ stream: { account: "APP-3", subject: "bus.store.APP-3.C4.>" } }
+				]
+			}
+			APP-3: {
+				users: [ { user: "user-app-3", password: "s3cr3t" } ]
+				exports: [
+					{ stream: "bus.store.APP-3.*.>" }
+				]
+				imports: [
+					{ stream: { account: "STORE", subject: "bus.store.CLOUD.*.%[2]s.>" }, to: "bus.store.CLOUD.*.>" }
+					{ stream: { account: "STORE", subject: "bus.store.CLOUD.*.ALL.>" }, to: "bus.store.CLOUD.*.>" }
+					{ stream: { account: "APP-1", subject: "bus.store.APP-1.*.>" } }
+					{ stream: { account: "APP-2", subject: "bus.store.APP-2.*.>" } }
+				]
+			}
+			SYS: {
+				users: [ { user: "system", password: "s3cr3t" } ]
+			}
+		}
+		system_account: "SYS"
+	`)
+
+	cloud, cloudConfigFile := startCloud(t, cloudConfig, -1)
+	require_True(t, cloud != nil)
+	require_True(t, cloudConfigFile != "")
 	defer cloud.Shutdown()
+	defer removeFile(t, cloudConfigFile)
 
-	store1, storeConfig1 := startStore(t, cloud.leafNodeInfo.Port, "user-store-1")
+	store1, storeConfigFile1 := startStore(t, storeConfig, cloud.leafNodeInfo.Port, "user-store-1", "1", -1)
 	require_True(t, store1 != nil)
-	require_True(t, storeConfig1 != "")
-	defer removeFile(t, storeConfig1)
+	require_True(t, storeConfigFile1 != "")
 	defer store1.Shutdown()
+	defer removeFile(t, storeConfigFile1)
 
-	store2, storeConfig2 := startStore(t, cloud.leafNodeInfo.Port, "user-store-2")
+	store2, storeConfigFile2 := startStore(t, storeConfig, cloud.leafNodeInfo.Port, "user-store-2", "2", -1)
 	require_True(t, store2 != nil)
-	require_True(t, storeConfig2 != "")
-	defer removeFile(t, storeConfig2)
+	require_True(t, storeConfigFile2 != "")
 	defer store2.Shutdown()
+	defer removeFile(t, storeConfigFile2)
 
+	// Uncomment and change cloudPort and storePort ports to fixed numbers (e.g. 4222, 4322, 4422) for quick ad-hoc environment
 	//fmt.Printf("cloud url: [%s]\n", cloud.clientConnectURLs[0])
 	//fmt.Printf("store1 url: [%s]\n", store1.clientConnectURLs[0])
 	//fmt.Printf("store2 url: [%s]\n", store2.clientConnectURLs[0])
-	//
-	// select {}
+	//select {}
 
-	//testCases := []struct {
-	//	certStore   string
-	//	certMatchBy string
-	//	certMatch   string
-	//}{
-	//	{"WindowsCurrentUser", "Subject", "example.com"},
-	//	{"WindowsCurrentUser", "Issuer", "Synadia Communications Inc."},
-	//}
-	//for _, tc := range testCases {
-	//	t.Run(fmt.Sprintf("%s by %s match %s", tc.certStore, tc.certMatchBy, tc.certMatch), func(t *testing.T) {
-	//		runConfiguredLeaf(t, hubOptions.LeafNode.Port, tc.certStore, tc.certMatchBy, tc.certMatch)
-	//	})
-	//}
+	// Cloud app pub to specific store
+	// nats --server localhost:4222 --user user-cloud-app-1 --password s3cr3t pub bus.retail.CLOUD-APP-1.C4.2.order.blah.blah "hello from cloud-app-1 {{.TimeStamp}}"
+	// Other cloud apps should see, only store 2 should see
+
+	// Cloud app pub to all stores
+	// nats --server localhost:4222 --user user-cloud-app-1 --password s3cr3t pub bus.retail.CLOUD-APP-1.C4.ALL.order.blah.blah "hello from cloud-app-1 {{.TimeStamp}}"
+	// Other cloud apps should see, all stores should see
+
+	// Cloud app pub to other cloud apps only
+	// nats --server localhost:4222 --user user-cloud-app-1 --password s3cr3t pub bus.retail.CLOUD-APP-1.C4.NONE.order.blah.blah "hello from cloud-app-1 {{.TimeStamp}}"
+	// Other cloud apps should see, no stores should see
+
+	// Cloud app subs to all retail bus messages (cloud origin and store origin)
+	// nats --server localhost:4222 --user user-cloud-app-3 --password s3cr3t sub "bus.retail.>"
+	// Should see messages published from itself, another cloud-app, and a store
+
+	// Cloud app subs to all retail bus messages from a specific cloud app
+	// nats --server localhost:4222 --user user-cloud-app-3 --password s3cr3t sub "bus.retail.CLOUD-APP-2.>"
+	// Should see messages published from CLOUD-APP-2 only
+
+	// Cloud app subs to all retail bus messages from store apps only
+	// nats --server localhost:4222 --user user-cloud-app-3 --password s3cr3t sub "bus.retail.STORE.>"
+	// Should see messages published from store apps only
+
+	// Cloud app subs to all retail bus messages from a specific store only
+	// nats --server localhost:4222 --user user-cloud-app-3 --password s3cr3t sub "bus.retail.STORE.*.2.>"
+	// Should see messages published from store 2 only
+
+	// Store app pubs
+	// nats --server localhost:4322 --user user-app-1 --password s3cr3t pub "bus.store.APP-1.C1.order.blah.blah" "hello from store1 app1 {{.TimeStamp}}"
+	// Cloud apps should see, same-store apps (only) should see
+
+	// Store app subs to all store bus messages (cloud origin and same-store origin)
+	// nats --server localhost:4322 --user user-app-3  --password s3cr3t sub "bus.store.>
+	// Should see messages published from any same-store app and cloud apps
+
+	// Store app subs to a specific store app
+	// nats --server localhost:4322 --user user-app-3  --password s3cr3t sub "bus.store.APP-2.>
+	// Should see messages published from only that store app and only same-store instance
+
+	// Store app subs to store bus messages from cloud only
+	// nats --server localhost:4322 --user user-app-3  --password s3cr3t sub "bus.store.CLOUD.>
+	// Should see messages published from only CLOUD apps
+	// Should see messages from CLOUD only intended for the specific store (or ALL stores)
+
+	// Store app configured only for Classification 4 ("C4") messages should see only C4 messages
+	// nats --server localhost:4322 --user user-app-2  --password s3cr3t sub "bus.store.>
+	// Should see only C4 messages from other same-store apps and cloud (where APP-2 configured with C4 restriction)
+
 }
