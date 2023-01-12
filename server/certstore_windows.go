@@ -43,7 +43,6 @@ import (
 
 const (
 	// wincrypt.h constants
-
 	winAcquireCached           = 0x1                                                   // CRYPT_ACQUIRE_CACHE_FLAG
 	winAcquireSilent           = 0x40                                                  // CRYPT_ACQUIRE_SILENT_FLAG
 	winAcquireOnlyNCryptKey    = 0x40000                                               // CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG
@@ -63,10 +62,7 @@ const (
 	winFindIssuerStr  = winCompareNameStrW<<winCompareShift | winInfoIssuerFlag  // CERT_FIND_ISSUER_STR_W
 	winFindSubjectStr = winCompareNameStrW<<winCompareShift | winInfoSubjectFlag // CERT_FIND_SUBJECT_STR_W
 
-	winSignatureKeyUsage     = 0x80                     // CERT_DIGITAL_SIGNATURE_KEY_USAGE
-	winNcryptKeySpec         = 0xFFFFFFFF               // CERT_NCRYPT_KEY_SPEC
-	WinCertStoreCurrentUser  = winCertStoreCurrentUser  // CurrentUser context
-	WinCertStoreLocalMachine = winCertStoreLocalMachine // LocalMachine context
+	winNcryptKeySpec = 0xFFFFFFFF // CERT_NCRYPT_KEY_SPEC
 
 	winBCryptPadPSS     uintptr = 0x8 // Modern TLS 1.2+
 	winBCryptPadPSSSalt uint32  = 32  // default 20, 32 optimal for typical SHA256 hash
@@ -83,12 +79,7 @@ const (
 
 	winCryptENotFound = 0x80092004 // CRYPT_E_NOT_FOUND
 
-	ProviderMSSoftware = "Microsoft Software Key Storage Provider"
-
-	winHCCELocalMachine                  = windows.Handle(0x01) // HCCE_LOCAL_MACHINE
-	winCertChainCacheOnlyURLRetrieval    = 0x00000004           // CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL
-	winCertChainDisableAIA               = 0x00002000           // CERT_CHAIN_DISABLE_AIA
-	winCertChainRevocationCheckCacheOnly = 0x80000000           // CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY
+	providerMSSoftware = "Microsoft Software Key Storage Provider"
 )
 
 var (
@@ -126,14 +117,10 @@ var (
 	winMyStore = winWide("MY")
 
 	// These DLLs must be available on all Windows hosts
-
 	winCrypt32 = windows.MustLoadDLL("crypt32.dll")
 	winNCrypt  = windows.MustLoadDLL("ncrypt.dll")
 
 	winCertFindCertificateInStore        = winCrypt32.MustFindProc("CertFindCertificateInStore")
-	winCertFreeCertificateChain          = winCrypt32.MustFindProc("CertFreeCertificateChain")
-	winCertGetCertificateChain           = winCrypt32.MustFindProc("CertGetCertificateChain")
-	winCertGetIntendedKeyUsage           = winCrypt32.MustFindProc("CertGetIntendedKeyUsage")
 	winCryptAcquireCertificatePrivateKey = winCrypt32.MustFindProc("CryptAcquireCertificatePrivateKey")
 	winNCryptExportKey                   = winNCrypt.MustFindProc("NCryptExportKey")
 	winNCryptFreeObject                  = winNCrypt.MustFindProc("NCryptFreeObject")
@@ -149,42 +136,48 @@ type winPSSPaddingInfo struct {
 	cbSalt   uint32
 }
 
+// CertStoreTLSConfig fulfills the same function as reading cert and key pair from pem files but
+// sources the Windows certificate store instead
 func CertStoreTLSConfig(tc *TLSConfigOpts, config *tls.Config) error {
 	var (
-		cert *x509.Certificate
-		ctx  *windows.CertContext
-		pk   *winKey
+		leaf     *x509.Certificate
+		leafCtx  *windows.CertContext
+		pk       *winKey
+		vOpts    = x509.VerifyOptions{}
+		chains   [][]*x509.Certificate
+		chain    []*x509.Certificate
+		rawChain [][]byte
 	)
 
 	// By CertStoreType, open a CertStore
 	if tc.CertStore == WindowsCurrentUser || tc.CertStore == WindowsLocalMachine {
 		var scope uint32
-		cs, err := winOpenCertStore(ProviderMSSoftware)
+		cs, err := winOpenCertStore(providerMSSoftware)
 		if err != nil || cs == nil {
 			return err
 		}
 		if tc.CertStore == WindowsCurrentUser {
-			scope = WinCertStoreCurrentUser
+			scope = winCertStoreCurrentUser
 		}
 		if tc.CertStore == WindowsLocalMachine {
-			scope = WinCertStoreLocalMachine
+			scope = winCertStoreLocalMachine
 		}
-		// certByIssuer or certBySubject
 
+		// certByIssuer or certBySubject
 		if tc.CertMatchBy == MatchBySubject || tc.CertMatchBy == _CERTMATCHBYEMPTY_ {
-			cert, ctx, err = cs.certBySubject(tc.CertMatch, scope)
+			leaf, leafCtx, err = cs.certBySubject(tc.CertMatch, scope)
 		} else if tc.CertMatchBy == MatchByIssuer {
-			cert, ctx, err = cs.certByIssuer(tc.CertMatch, scope)
+			leaf, leafCtx, err = cs.certByIssuer(tc.CertMatch, scope)
 		} else {
 			return fmt.Errorf("cert match by type not implemented")
 		}
 		if err != nil {
 			return err
 		}
-		if cert == nil || ctx == nil {
+		if leaf == nil || leafCtx == nil {
 			return fmt.Errorf("no cert match in cert store")
 		}
-		pk, err = cs.certKey(ctx)
+		pk, err = cs.certKey(leafCtx)
 		if err != nil {
 			return err
 		}
@@ -195,14 +188,39 @@ func CertStoreTLSConfig(tc *TLSConfigOpts, config *tls.Config) error {
 		return fmt.Errorf("cert store type not implemented")
 	}
 
+	// Get intermediates in the cert store for the found leaf IFF there is a full chain of trust in the store
+	// otherwise just use leaf as the final chain.
+	//
+	// Using std lib Verify as a reliable way to get valid chains out of the win store for the leaf; however,
+	// using empty options since server TLS stanza could be TLS role as server identity or client identity.
+	chains, err := leaf.Verify(vOpts)
+	if err != nil || len(chains) == 0 {
+		chains = append(chains, []*x509.Certificate{leaf})
+	}
+
+	// We have at least one verified chain so pop the first chain and remove the self-signed CA cert (if present)
+	// from the end of the chain
+	chain = chains[0]
+	if len(chain) > 1 {
+		chain = chain[:len(chain)-1]
+	}
+
+	// For tls.Certificate.Certificate need a [][]byte from []*x509.Certificate
+	// Approximate capacity for efficiency
+	rawChain = make([][]byte, 0, len(chain))
+	for _, link := range chain {
+		rawChain = append(rawChain, link.Raw)
+	}
+
 	tlsCert := tls.Certificate{
-		Certificate: [][]byte{cert.Raw},
+		Certificate: rawChain,
 		PrivateKey:  pk,
-		Leaf:        cert,
+		Leaf:        leaf,
 	}
 	config.Certificates = []tls.Certificate{tlsCert}
 
-	// FIXME(tgb) pk has an unsafe pointer that _should_ be freed but pk needs to live for Signing
+	// note: pk is a windows pointer (not freed by Go) but needs to live the life of the server for Signing.
+	// The cert context (leafCtx) windows pointer must not be freed underneath the pk so also life of the server.
 	return nil
 }
 
@@ -247,20 +265,6 @@ func winFindCert(store windows.Handle, enc, findFlags, findType uint32, para *ui
 	return (*windows.CertContext)(unsafe.Pointer(h)), nil
 }
 
-// FIXME(tgb) May have to return if holding context for life of server has negative impact
-// TLS signatures may be required repeatedly as connections may be lost and renegotiated
-// WinFreeCertContext frees a certificate context after use.
-//func WinFreeCertContext(ctx *windows.CertContext) error {
-//	return windows.CertFreeCertificateContext(ctx)
-//}
-
-// winIntendedKeyUsage wraps the CertGetIntendedKeyUsage library call. If there are key usage bytes they will be returned,
-// otherwise 0 will be returned. The final parameter (2) represents the size in bytes of &usage.
-func winIntendedKeyUsage(enc uint32, cert *windows.CertContext) (usage uint16) {
-	_, _, _ = winCertGetIntendedKeyUsage.Call(uintptr(enc), uintptr(unsafe.Pointer(cert.CertInfo)), uintptr(unsafe.Pointer(&usage)), 2)
-	return
-}
-
 // winCertStore is a CertStore implementation for the Windows Certificate Store.
 type winCertStore struct {
 	Prov     uintptr
@@ -293,71 +297,6 @@ func winCertContextToX509(ctx *windows.CertContext) (*x509.Certificate, error) {
 	slice.Len = int(ctx.Length)
 	slice.Cap = int(ctx.Length)
 	return x509.ParseCertificate(der)
-}
-
-// winExtractSimpleChain extracts the requested certificate chain from a CertSimpleChain.
-// Adapted from crypto.x509.root_windows
-func winExtractSimpleChain(simpleChain **windows.CertSimpleChain, chainCount, chainIndex int) ([]*x509.Certificate, error) {
-	if simpleChain == nil || chainCount == 0 || chainIndex >= chainCount {
-		return nil, errors.New("invalid simple chain")
-	}
-	simpleChains := (*[1 << 20]*windows.CertSimpleChain)(unsafe.Pointer(simpleChain))[:chainCount:chainCount]
-
-	// Each simple chain contains the chain of certificates, summary trust information
-	// about the chain, and trust information about each certificate element in the chain.
-	lastChain := simpleChains[chainIndex]
-	chainLen := int(lastChain.NumElements)
-	elements := (*[1 << 20]*windows.CertChainElement)(unsafe.Pointer(lastChain.Elements))[:chainLen:chainLen]
-	chain := make([]*x509.Certificate, 0, chainLen)
-	for _, element := range elements {
-		xc, err := winCertContextToX509(element.CertContext)
-		if err != nil {
-			return nil, err
-		}
-		chain = append(chain, xc)
-	}
-	return chain, nil
-}
-
-// resolveChains builds chains to roots from a given certificate using the local machine store.
-func (w *winCertStore) resolveChains(cert *windows.CertContext) error {
-	var (
-		chainPara windows.CertChainPara
-		chainCtx  *windows.CertChainContext
-	)
-
-	// Search the system for candidate certificate chains.
-	chainPara.Size = uint32(unsafe.Sizeof(chainPara))
-	success, _, err := winCertGetCertificateChain.Call(
-		uintptr(unsafe.Pointer(winHCCELocalMachine)),
-		uintptr(unsafe.Pointer(cert)),
-		uintptr(unsafe.Pointer(nil)), // Use current system time as validation time.
-		uintptr(cert.Store),
-		uintptr(unsafe.Pointer(&chainPara)),
-		winCertChainRevocationCheckCacheOnly|winCertChainCacheOnlyURLRetrieval|winCertChainDisableAIA,
-		uintptr(unsafe.Pointer(nil)), // Reserved.
-		uintptr(unsafe.Pointer(&chainCtx)),
-	)
-	if success == 0 {
-		return fmt.Errorf("winCertGetCertificateChain: %v", err)
-	}
-	defer func(winCertFreeCertificateChain *windows.Proc, a uintptr) {
-		_, _, err := winCertFreeCertificateChain.Call(a)
-		if err != nil {
-			// skip
-		}
-	}(winCertFreeCertificateChain, uintptr(unsafe.Pointer(chainCtx)))
-
-	chainCount := int(chainCtx.ChainCount)
-	certChains := make([][]*x509.Certificate, 0, chainCount)
-	for i := 0; i < chainCount; i++ {
-		x509Certs, err := winExtractSimpleChain(chainCtx.Chains, chainCount, i)
-		if err != nil {
-			return fmt.Errorf("winExtractSimpleChain: %v", err)
-		}
-		certChains = append(certChains, x509Certs)
-	}
-	return nil
 }
 
 // certByIssuer matches and returns the first certificate found by passed issuer.
@@ -396,30 +335,25 @@ func (w *winCertStore) certSearch(searchType uint32, matchValue string, searchRo
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/aa376064(v=vs.85).aspx
 	nc, err := winFindCert(h, winEncodingX509ASN|winEncodingPKCS7, 0, searchType, i, prev)
 	if err != nil {
-		return nil, nil, fmt.Errorf("finding certificates: %v", err)
+		return nil, nil, fmt.Errorf("error acquiring cert from store: %v", err)
 	}
 	if nc != nil {
 		// certificate found
 		prev = nc
 
-		if (winIntendedKeyUsage(winEncodingX509ASN, nc) & winSignatureKeyUsage) != 0 {
-			// Extract the DER-encoded certificate from the cert context.
-			xc, err := winCertContextToX509(nc)
-			if err == nil {
-				cert = xc
-			} else {
-				print(err.Error())
-			}
+		// Extract the DER-encoded certificate from the cert context.
+		xc, err := winCertContextToX509(nc)
+		if err == nil {
+			cert = xc
+		} else {
+			return nil, nil, fmt.Errorf("unable to extract x509 from cert: [%s]", err.Error())
 		}
+	} else {
+		return nil, nil, fmt.Errorf("could not find cert in store")
 	}
 
 	if cert == nil {
-		return nil, nil, nil
-	}
-
-	// Affect CRL processing
-	if err := w.resolveChains(prev); err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("unknown error extracting x509 from cert")
 	}
 
 	return cert, prev, nil
@@ -431,22 +365,6 @@ func winFreeObject(h uintptr) error {
 		return nil
 	}
 	return fmt.Errorf("NCryptFreeObject returned %X: %v", r, err)
-}
-
-// Close frees the handle to the certificate provider, the certificate store, etc.
-func (w *winCertStore) close() error {
-	var result error
-	for _, v := range w.stores {
-		if v != nil {
-			if err := v.close(); err != nil {
-				// skip
-			}
-		}
-	}
-	if err := winFreeObject(w.Prov); err != nil {
-		// skip
-	}
-	return result
 }
 
 type winStoreHandle struct {
@@ -469,13 +387,6 @@ func winNewStoreHandle(provider uint32, store *uint16) (*winStoreHandle, error) 
 	}
 	s.handle = &st
 	return &s, nil
-}
-
-func (s *winStoreHandle) close() error {
-	if s.handle != nil {
-		return windows.CertCloseStore(*s.handle, 1)
-	}
-	return nil
 }
 
 // winKey implements crypto.Signer and crypto.Decrypter for key based operations.
@@ -565,7 +476,6 @@ func winPackECDSASigValue(r io.Reader, digestLength int) ([]byte, error) {
 }
 
 func winSignRSA(kh uintptr, digest []byte, algID *uint16) ([]byte, error) {
-
 	// PSS padding for TLS 1.2+
 	padInfo := winPSSPaddingInfo{pszAlgID: algID, cbSalt: winBCryptPadPSSSalt}
 
@@ -653,10 +563,7 @@ func winKeyMetadata(kh uintptr) (*winKey, error) {
 		return nil, fmt.Errorf("unable to determine key provider: %v", err)
 	}
 	defer func(h uintptr) {
-		err := winFreeObject(h)
-		if err != nil {
-			// skip
-		}
+		_ = winFreeObject(h)
 	}(ph)
 
 	alg, err := winGetPropertyStr(kh, winNCryptAlgorithmGroupProperty)
@@ -870,7 +777,7 @@ func winUnmarshalRSA(buf []byte) (*rsa.PublicKey, error) {
 	return pub, nil
 }
 
-// Returns a handle to a given cert store, opening the handle as needed.
+// storeHandle returns a handle to a given cert store, opening the handle as needed.
 func (w *winCertStore) storeHandle(provider uint32, store *uint16) (windows.Handle, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
