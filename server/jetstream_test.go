@@ -11623,7 +11623,7 @@ func TestJetStreamSourceBasics(t *testing.T) {
 		Name:    "MS",
 		Storage: FileStorage,
 		Sources: []*StreamSource{
-			{Name: "foo"},
+			{Name: "foo", SubjectTransform: "foo2.>"},
 			{Name: "bar"},
 			{Name: "baz"},
 		},
@@ -11646,6 +11646,14 @@ func TestJetStreamSourceBasics(t *testing.T) {
 		}
 		return nil
 	})
+
+	m, err := js.GetMsg("MS", 1)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if m.Subject != "foo2.foo" {
+		t.Fatalf("Expected message subject foo2.foo, got %s", m.Subject)
+	}
 
 	// Test Source Updates
 	ncfg := &nats.StreamConfig{
@@ -11688,7 +11696,7 @@ func TestJetStreamSourceBasics(t *testing.T) {
 		return nil
 	})
 	// Double check first starting.
-	m, err := js.GetMsg("FMS", 1)
+	m, err = js.GetMsg("FMS", 1)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
