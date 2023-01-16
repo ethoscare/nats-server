@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/minio/highwayhash"
 	"github.com/nats-io/nuid"
 )
 
@@ -949,6 +950,10 @@ func (js *jetStream) monitorCluster() {
 		beenLeader   bool
 	)
 
+	// Highwayhash key for generating hashes.
+	key := make([]byte, 32)
+	rand.Read(key)
+
 	// Set to true to start.
 	js.setMetaRecovering()
 
@@ -958,10 +963,10 @@ func (js *jetStream) monitorCluster() {
 		if js.isMetaRecovering() {
 			return
 		}
-		if snap := js.metaSnapshot(); !bytes.Equal(lastSnap, snap) {
+		snap := js.metaSnapshot()
+		if hash := highwayhash.Sum(snap, key); !bytes.Equal(hash[:], lastSnap) {
 			if err := n.InstallSnapshot(snap); err == nil {
-				lastSnap = snap
-				lastSnapTime = time.Now()
+				lastSnap, lastSnapTime = hash[:], time.Now()
 			}
 		}
 	}
@@ -1220,6 +1225,11 @@ func (js *jetStream) applyMetaSnapshot(buf []byte) error {
 	// Now walk the ones to check and process consumers.
 	var caAdd, caDel []*consumerAssignment
 	for _, sa := range saChk {
+		// Make sure to add in all the new ones from sa.
+		for _, ca := range sa.consumers {
+			caAdd = append(caAdd, ca)
+		}
+
 		if osa := js.streamAssignment(sa.Client.serviceAccount(), sa.Config.Name); osa != nil {
 			for _, ca := range osa.consumers {
 				if sa.consumers[ca.Name] == nil {
@@ -1807,16 +1817,22 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 	}
 	accName := acc.GetName()
 
+	// Hash of the last snapshot (fixed size in memory).
 	var lastSnap []byte
+
+	// Highwayhash key for generating hashes.
+	key := make([]byte, 32)
+	rand.Read(key)
 
 	// Should only to be called from leader.
 	doSnapshot := func() {
 		if mset == nil || isRestore {
 			return
 		}
-		if snap := mset.stateSnapshot(); !bytes.Equal(lastSnap, snap) {
+		snap := mset.stateSnapshot()
+		if hash := highwayhash.Sum(snap, key); !bytes.Equal(hash[:], lastSnap) {
 			if err := n.InstallSnapshot(snap); err == nil {
-				lastSnap = snap
+				lastSnap = hash[:]
 			}
 		}
 	}
@@ -3914,6 +3930,11 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 	t := time.NewTicker(compactInterval + rci)
 	defer t.Stop()
 
+	// Highwayhash key for generating hashes.
+	key := make([]byte, 32)
+	rand.Read(key)
+
+	// Hash of the last snapshot (fixed size in memory).
 	var lastSnap []byte
 	var lastSnapTime time.Time
 
@@ -3931,11 +3952,13 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			needSnap = nb > 0 && ne >= compactNumMin || nb > compactSizeMin
 		}
 
-		if snap, err := o.store.EncodedState(); err == nil && (!bytes.Equal(lastSnap, snap) || needSnap) {
-			if err := n.InstallSnapshot(snap); err == nil {
-				lastSnap, lastSnapTime = snap, time.Now()
-			} else {
-				s.Warnf("Failed to install snapshot for '%s > %s > %s' [%s]: %v", o.acc.Name, ca.Stream, ca.Name, n.Group(), err)
+		if snap, err := o.store.EncodedState(); err == nil {
+			if hash := highwayhash.Sum(snap, key); !bytes.Equal(hash[:], lastSnap) || needSnap {
+				if err := n.InstallSnapshot(snap); err == nil {
+					lastSnap, lastSnapTime = hash[:], time.Now()
+				} else {
+					s.Warnf("Failed to install snapshot for '%s > %s > %s' [%s]: %v", o.acc.Name, ca.Stream, ca.Name, n.Group(), err)
+				}
 			}
 		}
 	}
@@ -5585,7 +5608,6 @@ func (s *Server) jsClusteredStreamPurgeRequest(
 	rmsg []byte,
 	preq *JSApiStreamPurgeRequest,
 ) {
-
 	js, cc := s.getJetStreamCluster()
 	if js == nil || cc == nil {
 		return
@@ -7113,7 +7135,6 @@ RETRY:
 	})
 	if err != nil {
 		s.Errorf("Could not subscribe to stream catchup: %v", err)
-		err = nil
 		goto RETRY
 	}
 	// Send our sync request.

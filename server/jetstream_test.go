@@ -7603,9 +7603,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 
 	// This will get the current information about usage and limits for this account.
 	resp, err := nc.Request(JSApiAccountInfo, nil, time.Second)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
+	require_NoError(t, err)
 	var info JSApiAccountInfoResponse
 	if err := json.Unmarshal(resp.Data, &info); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -7691,6 +7689,9 @@ func TestJetStreamRequestAPI(t *testing.T) {
 
 	// Make sure list names works.
 	resp, err = nc.Request(JSApiStreams, nil, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 	var namesResponse JSApiStreamNamesResponse
 	if err = json.Unmarshal(resp.Data, &namesResponse); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -7714,6 +7715,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 
 	// Now do detailed version.
 	resp, err = nc.Request(JSApiStreamList, nil, time.Second)
+	require_NoError(t, err)
 	var listResponse JSApiStreamListResponse
 	if err = json.Unmarshal(resp.Data, &listResponse); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -14252,7 +14254,7 @@ func TestJetStreamPullConsumerCrossAccountsAndLeafNodes(t *testing.T) {
 	nc2, _ := jsClientConnect(t, s2, nats.UserInfo("m", "p"))
 	defer nc2.Close()
 
-	req := &JSApiConsumerGetNextRequest{Batch: toSend}
+	req := &JSApiConsumerGetNextRequest{Batch: toSend, Expires: 500 * time.Millisecond}
 	jreq, err := json.Marshal(req)
 	require_NoError(t, err)
 
@@ -14282,7 +14284,7 @@ func TestJetStreamPullConsumerCrossAccountsAndLeafNodes(t *testing.T) {
 
 	// Remove interest.
 	sub.Unsubscribe()
-	// Make sure requests go away.
+	// Make sure requests go away eventually after they expire.
 	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
 		ci, err := js.ConsumerInfo("PC", "PC")
 		require_NoError(t, err)
@@ -19135,4 +19137,199 @@ func TestJetStreamStreamUpdateSubjectsOverlapOthers(t *testing.T) {
 	})
 	require_Error(t, err)
 	require_Contains(t, err.Error(), "overlap")
+}
+
+func TestJetStreamMetaDataFailOnKernelFault(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		js.Publish("foo", []byte("OK"))
+	}
+
+	sd := s.JetStreamConfig().StoreDir
+	sdir := filepath.Join(sd, "$G", "streams", "TEST")
+	s.Shutdown()
+
+	// Emulate if the kernel did not flush out to disk the meta information.
+	// so we will zero out both meta.inf and meta.sum.
+	err = os.WriteFile(filepath.Join(sdir, JetStreamMetaFile), nil, defaultFilePerms)
+	require_NoError(t, err)
+
+	err = os.WriteFile(filepath.Join(sdir, JetStreamMetaFileSum), nil, defaultFilePerms)
+	require_NoError(t, err)
+
+	// Restart.
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	// The stream will have not been recovered. So err is normal.
+	_, err = js.StreamInfo("TEST")
+	require_Error(t, err)
+
+	// Make sure we are signaled here from healthz
+	hs := s.healthz(nil)
+	const expected = "JetStream stream '$G > TEST' could not be recovered"
+	if hs.Status != "unavailable" || hs.Error == _EMPTY_ {
+		t.Fatalf("Expected healthz to return an error")
+	} else if hs.Error != expected {
+		t.Fatalf("Expected healthz error %q got %q", expected, hs.Error)
+	}
+
+	// If we add it back, this should recover the msgs.
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	// Make sure we recovered.
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_True(t, si.State.Msgs == 10)
+
+	// Now if we restart the server, meta should be correct,
+	// and the stream should be restored.
+	s.Shutdown()
+
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Make sure we recovered the stream correctly after re-adding.
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_True(t, si.State.Msgs == 10)
+}
+
+func TestJetstreamConsumerSingleTokenSubject(t *testing.T) {
+
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	filterSubject := "foo"
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{filterSubject},
+	})
+	require_NoError(t, err)
+
+	req, err := json.Marshal(&CreateConsumerRequest{Stream: "TEST", Config: ConsumerConfig{
+		FilterSubject: filterSubject,
+		Name:          "name",
+	}})
+
+	if err != nil {
+		t.Fatalf("failed to marshal consumer create request: %v", err)
+	}
+
+	resp, err := nc.Request(fmt.Sprintf("$JS.API.CONSUMER.CREATE.%s.%s.%s", "TEST", "name", "not_filter_subject"), req, time.Second*10)
+
+	var apiResp ApiResponse
+	json.Unmarshal(resp.Data, &apiResp)
+	if err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if apiResp.Error == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if apiResp.Error.ErrCode != 10131 {
+		t.Fatalf("expected error 10131, got %v", apiResp.Error)
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/3734
+func TestJetStreamMsgBlkFailOnKernelFault(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		MaxBytes: 10 * 1024 * 1024, // 10MB
+	})
+	require_NoError(t, err)
+
+	msgSize := 1024 * 1024 // 1MB
+	msg := make([]byte, msgSize)
+	rand.Read(msg)
+
+	for i := 0; i < 20; i++ {
+		_, err := js.Publish("foo", msg)
+		require_NoError(t, err)
+	}
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_True(t, si.State.Bytes < uint64(si.Config.MaxBytes))
+
+	// Now emulate a kernel fault that fails to write the last blk properly.
+	mset, err := s.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	mset.mu.RLock()
+	fs := mset.store.(*fileStore)
+	fs.mu.RLock()
+	require_True(t, len(fs.blks) > 2)
+	// Here we do not grab the last one, which we handle correctly. We grab an interior one near the end.
+	lmbf := fs.blks[len(fs.blks)-2].mfn
+	fs.mu.RUnlock()
+	mset.mu.RUnlock()
+
+	sd := s.JetStreamConfig().StoreDir
+	s.Shutdown()
+
+	// Zero out the last block.
+	err = os.WriteFile(lmbf, nil, defaultFilePerms)
+	require_NoError(t, err)
+
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_True(t, si.State.NumDeleted == 3)
+
+	// Test detailed version as well.
+	si, err = js.StreamInfo("TEST", &nats.StreamInfoRequest{DeletedDetails: true})
+	require_NoError(t, err)
+	require_True(t, si.State.NumDeleted == 3)
+	if !reflect.DeepEqual(si.State.Deleted, []uint64{16, 17, 18}) {
+		t.Fatalf("Expected deleted of %+v, got %+v", []uint64{16, 17, 18}, si.State.Deleted)
+	}
+
+	for i := 0; i < 20; i++ {
+		_, err := js.Publish("foo", msg)
+		require_NoError(t, err)
+	}
+
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	if si.State.Bytes > uint64(si.Config.MaxBytes) {
+		t.Fatalf("MaxBytes not enforced with empty interior msg blk, max %v, bytes %v",
+			friendlyBytes(si.Config.MaxBytes), friendlyBytes(int64(si.State.Bytes)))
+	}
 }

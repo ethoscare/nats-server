@@ -14,6 +14,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -23,7 +24,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -2631,8 +2635,16 @@ type JSzOptions struct {
 
 // HealthzOptions are options passed to Healthz
 type HealthzOptions struct {
+	// Deprecated: Use JSEnabledOnly instead
+	JSEnabled     bool `json:"js-enabled,omitempty"`
 	JSEnabledOnly bool `json:"js-enabled-only,omitempty"`
 	JSServerOnly  bool `json:"js-server-only,omitempty"`
+}
+
+// ProfilezOptions are options passed to Profilez
+type ProfilezOptions struct {
+	Name  string `json:"name"`
+	Debug int    `json:"debug"`
 }
 
 type StreamDetail struct {
@@ -2985,7 +2997,8 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hs := s.healthz(&HealthzOptions{
-		JSEnabledOnly: jsEnabledOnly || jsEnabled,
+		JSEnabled:     jsEnabled,
+		JSEnabledOnly: jsEnabledOnly,
 		JSServerOnly:  jsServerOnly,
 	})
 	if hs.Error != _EMPTY_ {
@@ -3031,7 +3044,7 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 		return health
 	}
 	// Only check if JS is enabled, skip meta and asset check.
-	if opts.JSEnabledOnly {
+	if opts.JSEnabledOnly || opts.JSEnabled {
 		return health
 	}
 
@@ -3041,8 +3054,30 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 
 	cc := js.cluster
 
-	// Currently single server mode this is a no-op.
+	const na = "unavailable"
+
+	// Currently single server we make sure the streams were recovered.
 	if cc == nil || cc.meta == nil {
+		sdir := js.config.StoreDir
+		// Whip through account folders and pull each stream name.
+		fis, _ := os.ReadDir(sdir)
+		for _, fi := range fis {
+			acc, err := s.LookupAccount(fi.Name())
+			if err != nil {
+				health.Status = na
+				health.Error = fmt.Sprintf("JetStream account '%s' could not be resolved", fi.Name())
+				return health
+			}
+			sfis, _ := os.ReadDir(filepath.Join(sdir, fi.Name(), "streams"))
+			for _, sfi := range sfis {
+				stream := sfi.Name()
+				if _, err := acc.lookupStream(stream); err != nil {
+					health.Status = na
+					health.Error = fmt.Sprintf("JetStream stream '%s > %s' could not be recovered", acc, stream)
+					return health
+				}
+			}
+		}
 		return health
 	}
 
@@ -3052,13 +3087,13 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 
 	// If no meta leader.
 	if meta.GroupLeader() == _EMPTY_ {
-		health.Status = "unavailable"
+		health.Status = na
 		health.Error = "JetStream has not established contact with a meta leader"
 		return health
 	}
 	// If we are not current with the meta leader.
 	if !meta.Current() {
-		health.Status = "unavailable"
+		health.Status = na
 		health.Error = "JetStream is not current with the meta leader"
 		return health
 	}
@@ -3075,7 +3110,7 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 			if sa.Group.isMember(ourID) {
 				// Make sure we can look up
 				if !cc.isStreamCurrent(acc, stream) {
-					health.Status = "unavailable"
+					health.Status = na
 					health.Error = fmt.Sprintf("JetStream stream '%s > %s' is not current", acc, stream)
 					return health
 				}
@@ -3083,7 +3118,7 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 				for consumer, ca := range sa.consumers {
 					if ca.Group.isMember(ourID) {
 						if !cc.isConsumerCurrent(acc, stream, consumer) {
-							health.Status = "unavailable"
+							health.Status = na
 							health.Error = fmt.Sprintf("JetStream consumer '%s > %s > %s' is not current", acc, stream, consumer)
 							return health
 						}
@@ -3095,4 +3130,37 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 
 	// Success.
 	return health
+}
+
+type ProfilezStatus struct {
+	Profile []byte `json:"profile"`
+	Error   string `json:"error"`
+}
+
+func (s *Server) profilez(opts *ProfilezOptions) *ProfilezStatus {
+	if s.profiler == nil {
+		return &ProfilezStatus{
+			Error: "Profiling is not enabled",
+		}
+	}
+	if opts.Name == _EMPTY_ {
+		return &ProfilezStatus{
+			Error: "Profile name not specified",
+		}
+	}
+	profile := pprof.Lookup(opts.Name)
+	if profile == nil {
+		return &ProfilezStatus{
+			Error: fmt.Sprintf("Profile %q not found", opts.Name),
+		}
+	}
+	var buffer bytes.Buffer
+	if err := profile.WriteTo(&buffer, opts.Debug); err != nil {
+		return &ProfilezStatus{
+			Error: fmt.Sprintf("Profile %q error: %s", opts.Name, err),
+		}
+	}
+	return &ProfilezStatus{
+		Profile: buffer.Bytes(),
+	}
 }

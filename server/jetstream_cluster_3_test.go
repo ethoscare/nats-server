@@ -1074,7 +1074,7 @@ func TestJetStreamClusterSourceWithOptStartTime(t *testing.T) {
 		_, err = js.AddStream(&nats.StreamConfig{
 			Name:     "SOURCE",
 			Replicas: replicas,
-			Sources: []*nats.StreamSource{&nats.StreamSource{
+			Sources: []*nats.StreamSource{{
 				Name:         "TEST",
 				OptStartTime: &yesterday,
 			}},
@@ -2368,4 +2368,137 @@ func TestJetStreamClusterMemLeaderRestart(t *testing.T) {
 	if osi.Cluster.Leader == "" {
 		t.Fatalf("expected a current leader after old leader restarted")
 	}
+}
+
+// Customer reported R1 consumers that seemed to be ghosted after server restart.
+func TestJetStreamClusterLostConsumers(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "GHOST", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"events.>"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		for j := 0; j < 10; j++ {
+			_, err := js.Publish(fmt.Sprintf("events.%d.%d", i, j), []byte("test"))
+			require_NoError(t, err)
+		}
+	}
+
+	s := c.randomServer()
+	s.Shutdown()
+
+	c.waitOnLeader()
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
+	nc, _ = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cc := CreateConsumerRequest{
+		Stream: "TEST",
+		Config: ConsumerConfig{
+			AckPolicy: AckExplicit,
+		},
+	}
+	req, err := json.Marshal(cc)
+	require_NoError(t, err)
+
+	reqSubj := fmt.Sprintf(JSApiConsumerCreateT, "TEST")
+
+	// Now create 50 consumers. We do not wait for the answer.
+	for i := 0; i < 50; i++ {
+		nc.Publish(reqSubj, req)
+	}
+	nc.Flush()
+
+	// Grab the meta leader.
+	ml := c.leader()
+	require_NoError(t, ml.JetStreamSnapshotMeta())
+
+	numConsumerAssignments := func(s *Server) int {
+		t.Helper()
+		js := s.getJetStream()
+		js.mu.RLock()
+		defer js.mu.RUnlock()
+		cc := js.cluster
+		for _, asa := range cc.streams {
+			for _, sa := range asa {
+				return len(sa.consumers)
+			}
+		}
+		return 0
+	}
+
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		num := numConsumerAssignments(ml)
+		if num == 50 {
+			return nil
+		}
+		return fmt.Errorf("Consumers is only %d", num)
+	})
+
+	// Restart the server we shutdown. We snapshotted to the snapshot
+	// has to fill in the new consumers.
+	// The bug would fail to add them to the meta state since the stream
+	// existed.
+	s = c.restartServer(s)
+
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		num := numConsumerAssignments(s)
+		if num == 50 {
+			return nil
+		}
+		return fmt.Errorf("Consumers is only %d", num)
+	})
+}
+
+// https://github.com/nats-io/nats-server/issues/3636
+func TestJetStreamClusterScaleDownDuringServerOffline(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 100; i++ {
+		sendStreamMsg(t, nc, "foo", "hello")
+	}
+
+	s := c.randomNonStreamLeader(globalAccountName, "TEST")
+	s.Shutdown()
+
+	c.waitOnLeader()
+
+	nc, js = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+
+	s = c.restartServer(s)
+	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		hs := s.healthz(nil)
+		if hs.Error != _EMPTY_ {
+			return errors.New(hs.Error)
+		}
+		return nil
+	})
 }

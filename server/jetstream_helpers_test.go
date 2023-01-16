@@ -1027,6 +1027,14 @@ func (s *Server) closeAndDisableLeafnodes() {
 	}
 }
 
+// Helper function to re-enable leafnode connections.
+func (s *Server) reEnableLeafnodes() {
+	s.mu.Lock()
+	// Re-enable leafnodes.
+	s.leafDisableConnect = false
+	s.mu.Unlock()
+}
+
 // Helper to set the remote migrate feature.
 func (s *Server) setJetStreamMigrateOnRemoteLeaf() {
 	s.mu.Lock()
@@ -1099,18 +1107,6 @@ func jsClientConnectEx(t testing.TB, s *Server, domain string, opts ...nats.Opti
 		t.Fatalf("Unexpected error getting JetStream context: %v", err)
 	}
 	return nc, js
-}
-
-func jsClientConnectCluster(t testing.TB, c *cluster, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
-	t.Helper()
-
-	serverURLs := make([]string, len(c.servers))
-
-	for i, s := range c.servers {
-		serverURLs[i] = s.ClientURL()
-	}
-	url := strings.Join(serverURLs, ",")
-	return jsClientConnectURL(t, url, opts...)
 }
 
 func jsClientConnectURL(t testing.TB, url string, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
@@ -1734,12 +1730,4 @@ func (b *bitset) String() string {
 	}
 	sb.WriteString("\n")
 	return sb.String()
-}
-
-func toIndentedJsonString(v interface{}) string {
-	jsonBytes, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("Marshal error: %s", err)
-	}
-	return string(jsonBytes)
 }

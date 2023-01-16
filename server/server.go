@@ -103,6 +103,8 @@ type Info struct {
 	// LeafNode Specific
 	LeafNodeURLs  []string `json:"leafnode_urls,omitempty"`  // LeafNode URLs that the server can reconnect to.
 	RemoteAccount string   `json:"remote_account,omitempty"` // Lets the other side know the remote account that they bind to.
+
+	XKey string `json:"xkey,omitempty"` // Public server's x25519 key.
 }
 
 // Server is our main struct.
@@ -114,6 +116,8 @@ type Server struct {
 	stats
 	mu                  sync.RWMutex
 	kp                  nkeys.KeyPair
+	xkp                 nkeys.KeyPair
+	xpub                string
 	info                Info
 	configFile          string
 	optsMu              sync.RWMutex
@@ -332,9 +336,13 @@ func NewServer(opts *Options) (*Server, error) {
 	tlsReq := opts.TLSConfig != nil
 	verify := (tlsReq && opts.TLSConfig.ClientAuth == tls.RequireAndVerifyClientCert)
 
-	// Created server's nkey identity.
+	// Create our server's nkey identity.
 	kp, _ := nkeys.CreateServer()
 	pub, _ := kp.PublicKey()
+
+	// Create an xkey for encrypting messages from this server.
+	xkp, _ := nkeys.CreateCurveKeys()
+	xpub, _ := xkp.PublicKey()
 
 	serverName := pub
 	if opts.ServerName != _EMPTY_ {
@@ -353,6 +361,7 @@ func NewServer(opts *Options) (*Server, error) {
 
 	info := Info{
 		ID:           pub,
+		XKey:         xpub,
 		Version:      VERSION,
 		Proto:        PROTO,
 		GitCommit:    gitCommit,
@@ -378,6 +387,8 @@ func NewServer(opts *Options) (*Server, error) {
 
 	s := &Server{
 		kp:                 kp,
+		xkp:                xkp,
+		xpub:               xpub,
 		configFile:         opts.ConfigFile,
 		info:               info,
 		opts:               opts,
@@ -3598,7 +3609,7 @@ func (s *Server) acceptError(acceptName string, err error, tmpDelay time.Duratio
 		return -1
 	}
 	//lint:ignore SA1019 We want to retry on a bunch of errors here.
-	if ne, ok := err.(net.Error); ok && ne.Temporary() {
+	if ne, ok := err.(net.Error); ok && ne.Temporary() { // nolint:staticcheck
 		s.Errorf("Temporary %s Accept Error(%v), sleeping %dms", acceptName, ne, tmpDelay/time.Millisecond)
 		select {
 		case <-time.After(tmpDelay):

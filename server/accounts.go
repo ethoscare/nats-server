@@ -82,6 +82,7 @@ type Account struct {
 	expired      bool
 	incomplete   bool
 	signingKeys  map[string]jwt.Scope
+	extAuth      *jwt.ExternalAuthorization
 	srv          *Server // server this account is registered with (possibly nil)
 	lds          string  // loop detection subject for leaf nodes
 	siReply      []byte  // service reply prefix, will form wildcard subscription.
@@ -1928,6 +1929,13 @@ func (a *Account) subscribeInternal(subject string, cb msgHandler) (*subscriptio
 	return a.subscribeInternalEx(subject, cb, false)
 }
 
+// Unsubscribe from an internal account subscription.
+func (a *Account) unsubscribeInternal(sub *subscription) {
+	if ic := a.internalClient(); ic != nil {
+		ic.processUnsub(sub.sid)
+	}
+}
+
 // Creates internal subscription for service import responses.
 func (a *Account) subscribeServiceImportResponse(subject string) (*subscription, error) {
 	return a.subscribeInternalEx(subject, a.processServiceImportResponse, true)
@@ -2191,12 +2199,12 @@ func (a *Account) newServiceReply(tracking bool) []byte {
 		a.createRespWildcard()
 		createdSiReply = true
 	}
-	replyPre, isBoundToLeafnode := a.siReply, a.lds != _EMPTY_
+	replyPre := a.siReply
 	a.mu.Unlock()
 
 	// If we created the siReply and we are not bound to a leafnode
 	// we need to do the wildcard subscription.
-	if createdSiReply && !isBoundToLeafnode {
+	if createdSiReply {
 		a.subscribeServiceImportResponse(string(append(replyPre, '>')))
 	}
 
@@ -2356,18 +2364,7 @@ func (a *Account) addRespServiceImport(dest *Account, to string, osi *serviceImp
 		si.tracking = true
 		si.trackingHdr = header
 	}
-	isBoundToLeafnode := a.lds != _EMPTY_
 	a.mu.Unlock()
-
-	// We might not do individual subscriptions here like we do on configured imports.
-	// If we are bound to a leafnode we do explicit subscriptions for these.
-	// We have an internal callback for all responses inbound to this account and
-	// will process appropriately there. This does not pollute the sublist and the caches.
-
-	if isBoundToLeafnode {
-		sub, _ := a.subscribeServiceImportResponse(nrr)
-		si.sid = sub.sid
-	}
 
 	// We do add in the reverse map such that we can detect loss of interest and do proper
 	// cleanup of this si as interest goes away.
@@ -2984,6 +2981,65 @@ func (a *Account) traceLabel() string {
 	return a.Name
 }
 
+// Check if an account has external auth set.
+// Operator/Account Resolver only.
+func (a *Account) hasExternalAuth() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.extAuth != nil
+}
+
+// Deterimine if this is an external auth user.
+func (a *Account) isExternalAuthUser(userID string) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.extAuth != nil {
+		for _, u := range a.extAuth.AuthUsers {
+			if userID == u {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Return the external authorization xkey if external authorization is enabled and the xkey is set.
+// Operator/Account Resolver only.
+func (a *Account) externalAuthXKey() string {
+	if a == nil {
+		return _EMPTY_
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.extAuth != nil && a.extAuth.XKey != _EMPTY_ {
+		return a.extAuth.XKey
+	}
+	return _EMPTY_
+}
+
+// Check if an account switch for external authorization is allowed.
+func (a *Account) isAllowedAcount(acc string) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.extAuth != nil {
+		for _, a := range a.extAuth.AllowedAccounts {
+			if a == acc {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // updateAccountClaimsWithRefresh will update an existing account with new claims.
 // If refreshImportingAccounts is true it will also update incomplete dependent accounts
 // This will replace any exports or imports previously defined.
@@ -3002,6 +3058,14 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	// overwrite claim meta data
 	a.nameTag = ac.Name
 	a.tags = ac.Tags
+
+	// Check for external authorization.
+	if ac.HasExternalAuthorization() {
+		a.extAuth = &jwt.ExternalAuthorization{}
+		a.extAuth.AuthUsers.Add(ac.Authorization.AuthUsers...)
+		a.extAuth.AllowedAccounts.Add(ac.Authorization.AllowedAccounts...)
+		a.extAuth.XKey = ac.Authorization.XKey
+	}
 
 	// Reset exports and imports here.
 
@@ -3873,7 +3937,7 @@ func (dr *DirAccResolver) Start(s *Server) error {
 	for _, reqSub := range []string{accUpdateEventSubjOld, accUpdateEventSubjNew} {
 		// subscribe to account jwt update requests
 		if _, err := s.sysSubscribe(fmt.Sprintf(reqSub, "*"), func(_ *subscription, _ *client, _ *Account, subj, resp string, msg []byte) {
-			pubKey := _EMPTY_
+			var pubKey string
 			tk := strings.Split(subj, tsep)
 			if len(tk) == accUpdateTokensNew {
 				pubKey = tk[accReqAccIndex]
@@ -4159,7 +4223,7 @@ func (dr *CacheDirAccResolver) Start(s *Server) error {
 	for _, reqSub := range []string{accUpdateEventSubjOld, accUpdateEventSubjNew} {
 		// subscribe to account jwt update requests
 		if _, err := s.sysSubscribe(fmt.Sprintf(reqSub, "*"), func(_ *subscription, _ *client, _ *Account, subj, resp string, msg []byte) {
-			pubKey := _EMPTY_
+			var pubKey string
 			tk := strings.Split(subj, tsep)
 			if len(tk) == accUpdateTokensNew {
 				pubKey = tk[accReqAccIndex]
