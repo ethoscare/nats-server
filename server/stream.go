@@ -58,6 +58,9 @@ type StreamConfig struct {
 	Mirror       *StreamSource   `json:"mirror,omitempty"`
 	Sources      []*StreamSource `json:"sources,omitempty"`
 
+	// Allow applying a subject transform to incoming messages before doing anything else
+	InputSubjectTransform *InputSubjectTransform `json:"input_subject_transform,omitempty"`
+
 	// Allow republish of the message after being sequenced and stored.
 	RePublish *RePublish `json:"republish,omitempty"`
 
@@ -80,6 +83,12 @@ type StreamConfig struct {
 	// AllowRollup allows messages to be placed into the system and purge
 	// all older messages using a special msg header.
 	AllowRollup bool `json:"allow_rollup_hdrs"`
+}
+
+// InputSubjectTransform is for applying a subject transform (to matching messages) before doing anything else when a new message is received
+type InputSubjectTransform struct {
+	Source      string `json:"src,omitempty"`
+	Destination string `json:"dest"`
 }
 
 // RePublish is for republishing messages once committed to a stream.
@@ -222,6 +231,9 @@ type stream struct {
 
 	// Indicates we have direct consumers.
 	directs int
+
+	// For input subject transform
+	itr *subjectTransform
 
 	// For republishing.
 	tr *subjectTransform
@@ -418,7 +430,7 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 				_, err = newSubjectTransform(ssi.FilterSubject, ssi.SubjectTransform)
 				if err != nil {
 					jsa.mu.Unlock()
-					return nil, fmt.Errorf("invalid subject transform for the source %w", err)
+					return nil, fmt.Errorf("subject transform for the source not valid %w", err)
 				}
 			}
 		}
@@ -467,12 +479,22 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 		mset.ackq = s.newIPQueue(qpfx + "acks") // of uint64
 	}
 
+	// Check for input subject transform
+	if cfg.InputSubjectTransform != nil {
+		tr, err := newSubjectTransform(cfg.InputSubjectTransform.Source, cfg.InputSubjectTransform.Destination)
+		if err != nil {
+			jsa.mu.Unlock()
+			return nil, fmt.Errorf("stream input subject transform not valid %w", err)
+		}
+		mset.itr = tr
+	}
+
 	// Check for RePublish.
 	if cfg.RePublish != nil {
 		tr, err := newSubjectTransform(cfg.RePublish.Source, cfg.RePublish.Destination)
 		if err != nil {
 			jsa.mu.Unlock()
-			return nil, fmt.Errorf("stream configuration for republish not valid")
+			return nil, fmt.Errorf("stream republish transform not valid %w", err)
 		}
 		// Assign our transform for republishing.
 		mset.tr = tr
@@ -3712,6 +3734,15 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 	if c == nil {
 		mset.mu.Unlock()
 		return nil
+	}
+
+	// Apply the input subject transform if any
+	if mset.itr != nil {
+		ts, err := mset.itr.Match(subject)
+		if err == nil {
+			// no filtering: if the subject doesn't map the source of the transform, don't change it
+			subject = ts
+		}
 	}
 
 	var accName string

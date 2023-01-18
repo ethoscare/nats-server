@@ -11737,6 +11737,49 @@ func TestJetStreamSourceBasics(t *testing.T) {
 	}
 }
 
+func TestJetStreamInputTransform(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	createStream := func(cfg *StreamConfig) {
+		t.Helper()
+		req, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		rm, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var resp JSApiStreamCreateResponse
+		if err := json.Unmarshal(rm.Data, &resp); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("Unexpected error: %+v", resp.Error)
+		}
+	}
+
+	createStream(&StreamConfig{Name: "T1", Subjects: []string{"foo"}, InputSubjectTransform: &InputSubjectTransform{Source: ">", Destination: "transformed.>"}, Storage: MemoryStorage})
+
+	// publish a message
+	if _, err := js.Publish("foo", []byte("OK")); err != nil {
+		t.Fatalf("Unexpected publish error: %v", err)
+	}
+
+	m, err := js.GetMsg("T1", 1)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if m.Subject != "transformed.foo" {
+		t.Fatalf("Expected message subject transformed.foo, got %s", m.Subject)
+	}
+}
+
 func TestJetStreamOperatorAccounts(t *testing.T) {
 	s, _ := RunServerWithConfig("./configs/js-op.conf")
 	if config := s.JetStreamConfig(); config != nil {
