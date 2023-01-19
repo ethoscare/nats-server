@@ -47,6 +47,7 @@ type RaftNode interface {
 	Leader() bool
 	Quorum() bool
 	Current() bool
+	Healthy() bool
 	Term() uint64
 	GroupLeader() string
 	HadPreviousLeader() bool
@@ -1192,6 +1193,39 @@ func (n *raft) isCurrent() bool {
 	return false
 }
 
+// Lock should be held.
+func (n *raft) isHealthy() bool {
+	// First check if have had activity and if the applied is roughly keeping up
+	// to date with the number of commits (important for HEALTHZ under load).
+	if n.commit == 0 || (n.commit-n.applied) > 5 {
+		n.debug("Not current, commit %d != applied %d", n.commit, n.applied)
+		return false
+	}
+	// Make sure we are the leader or we know we have heard from the leader recently.
+	if n.state == Leader {
+		return true
+	}
+
+	// Check here on catchup status.
+	if cs := n.catchup; cs != nil && n.pterm >= cs.cterm && n.pindex >= cs.cindex {
+		n.cancelCatchup()
+	}
+
+	// Check to see that we have heard from the current leader lately.
+	if n.leader != noLeader && n.leader != n.id && n.catchup == nil {
+		okInterval := int64(hbInterval) * 2
+		ts := time.Now().UnixNano()
+		if ps := n.peers[n.leader]; ps != nil && ps.ts > 0 && (ts-ps.ts) <= okInterval {
+			return true
+		}
+		n.debug("Not current, no recent leader contact")
+	}
+	if cs := n.catchup; cs != nil {
+		n.debug("Not current, still catching up pindex=%d, cindex=%d", n.pindex, cs.cindex)
+	}
+	return false
+}
+
 // Current returns if we are the leader for our group or an up to date follower.
 func (n *raft) Current() bool {
 	if n == nil {
@@ -1200,6 +1234,16 @@ func (n *raft) Current() bool {
 	n.RLock()
 	defer n.RUnlock()
 	return n.isCurrent()
+}
+
+// Healthy returns if we are the leader for our group and nearly up-to-date.
+func (n *raft) Healthy() bool {
+	if n == nil {
+		return false
+	}
+	n.RLock()
+	defer n.RUnlock()
+	return n.isHealthy()
 }
 
 // HadPreviousLeader indicates if this group ever had a leader.
